@@ -223,6 +223,35 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(resolved_config, config_name)
         self.assertEqual(resolved_user, "")
 
+    def test_speed_uses_actual_poll_duration_and_expires(self):
+        for index, interval in enumerate((1, 1.5, 5, 20, 60)):
+            with self.subTest(interval=interval):
+                start = 10000 + index * 1000
+                with mock.patch.object(audit.time, "time", return_value=start):
+                    self.store.capture({"uploadTotal": 0, "downloadTotal": 0, "connections": []})
+                with mock.patch.object(audit.time, "time", return_value=start + interval):
+                    self.store.capture({"uploadTotal": int(100 * interval), "downloadTotal": int(200 * interval), "connections": []})
+                    summary = self.store.summary("1h")
+                self.assertEqual(summary["upload_speed"], 100)
+                self.assertEqual(summary["download_speed"], 200)
+                with mock.patch.object(audit.time, "time", return_value=start + interval * 4 + 12):
+                    self.assertEqual(self.store.summary("1h")["upload_speed"], 0)
+
+    def test_sqlite_failure_rolls_back_baseline_before_retry(self):
+        with mock.patch.object(audit.time, "time", return_value=20000):
+            self.store.capture({"uploadTotal": 0, "downloadTotal": 0, "connections": []})
+        self.store.db.execute("CREATE TEMP TRIGGER fail_sample BEFORE INSERT ON traffic_samples "
+                              "BEGIN SELECT RAISE(FAIL, 'synthetic write failure'); END")
+        with mock.patch.object(audit.time, "time", return_value=20002):
+            with self.assertRaises(sqlite3.Error):
+                self.store.capture({"uploadTotal": 200, "downloadTotal": 0, "connections": []})
+        self.store.db.execute("DROP TRIGGER fail_sample")
+        with mock.patch.object(audit.time, "time", return_value=20004):
+            self.store.capture({"uploadTotal": 400, "downloadTotal": 0, "connections": []})
+            summary = self.store.summary("1h")
+        self.assertEqual(summary["upload"], 400)
+        self.assertEqual(summary["upload_speed"], 100)
+
     def test_existing_database_is_migrated_without_losing_connections(self):
         self.store.close()
         database = os.path.join(self.temp.name, "legacy.db")
@@ -243,6 +272,30 @@ class StoreTests(unittest.TestCase):
         columns = {row[1] for row in self.store.db.execute("PRAGMA table_info(connections)")}
         self.assertIn("config_name", columns)
         self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM connections").fetchone()[0], 1)
+
+
+class CollectorTests(unittest.TestCase):
+    def test_sqlite_error_retries_and_success_resets_backoff(self):
+        collector = audit.Collector(None, "http://127.0.0.1:1", "", 1)
+        collector.stop_event = mock.Mock()
+        collector.stop_event.is_set.side_effect = [False, False, True]
+        with mock.patch.object(collector, "_poll", side_effect=[sqlite3.OperationalError("synthetic failure"), None]) as poll:
+            with mock.patch.object(audit.time, "monotonic", return_value=0):
+                collector._run()
+        self.assertEqual(poll.call_count, 2)
+        self.assertEqual(collector.stop_event.wait.call_args_list, [mock.call(2), mock.call(1)])
+
+    def test_connection_status_requires_live_thread_and_no_error(self):
+        collector = audit.Collector(None, "http://127.0.0.1:1", "", 1)
+        collector.last_success = time.time()
+        collector.last_error = ""
+        collector.thread = mock.Mock()
+        collector.thread.is_alive.return_value = False
+        self.assertFalse(collector.status()["connected"])
+        collector.thread.is_alive.return_value = True
+        self.assertTrue(collector.status()["connected"])
+        collector.last_error = "synthetic failure"
+        self.assertFalse(collector.status()["connected"])
 
 
 class FakeClashHandler(BaseHTTPRequestHandler):
@@ -304,7 +357,10 @@ class HttpIntegrationTests(unittest.TestCase):
 
     def test_health_auth_dashboard_and_export(self):
         with self.request("/api/health") as response:
-            self.assertTrue(json.load(response)["ok"])
+            health = json.load(response)
+            self.assertTrue(health["ok"])
+            self.assertTrue(health["collector_running"])
+            self.assertTrue(health["collector_connected"])
         with self.assertRaises(HTTPError) as denied:
             self.request("/api/summary")
         self.assertEqual(denied.exception.code, 401)

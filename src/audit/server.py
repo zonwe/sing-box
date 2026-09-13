@@ -312,7 +312,8 @@ class AuditStore:
         }
 
     def capture(self, snapshot, resolver=None):
-        now = int(time.time())
+        sampled_at = time.time()
+        now = int(sampled_at)
         connections = snapshot.get("connections") or []
         upload_total = max(0, as_int(snapshot.get("uploadTotal")))
         download_total = max(0, as_int(snapshot.get("downloadTotal")))
@@ -323,11 +324,19 @@ class AuditStore:
         with self.lock, self.db:
             old_upload = self._state_get("collector_upload_total")
             old_download = self._state_get("collector_download_total")
+            previous_sample = float(self._state_get("collector_sample_time") or self._state_get("collector_last_success") or sampled_at)
+            sample_seconds = max(0.0, sampled_at - previous_sample)
             initial_snapshot = old_upload is None and old_download is None
             upload_delta = 0 if old_upload is None else (upload_total - as_int(old_upload) if upload_total >= as_int(old_upload) else upload_total)
             download_delta = 0 if old_download is None else (download_total - as_int(old_download) if download_total >= as_int(old_download) else download_total)
             upload_delta = max(0, upload_delta)
             download_delta = max(0, download_delta)
+            # Persist the duration and rate together with the counter baseline.
+            # A sparse poll must not be treated as a one-second traffic sample.
+            self._state_set("collector_upload_speed", int(upload_delta / sample_seconds) if sample_seconds else 0)
+            self._state_set("collector_download_speed", int(download_delta / sample_seconds) if sample_seconds else 0)
+            self._state_set("collector_sample_seconds", sample_seconds)
+            self._state_set("collector_sample_time", sampled_at)
             row = self.db.execute("SELECT upload, download FROM traffic_samples WHERE ts = ?", (now,)).fetchone()
             if row:
                 upload_delta += row["upload"]
@@ -469,7 +478,7 @@ class AuditStore:
         )
 
     def summary(self, range_name, start=None, end=None):
-        now = int(time.time())
+        now = time.time()
         since, until = self.time_window(range_name, start, end)
         with self.lock:
             totals = self.db.execute(
@@ -477,11 +486,11 @@ class AuditStore:
                 "FROM traffic_samples WHERE ts BETWEEN ? AND ?",
                 (since, until),
             ).fetchone()
-            recent = self.db.execute(
-                "SELECT COALESCE(SUM(upload), 0) AS upload, COALESCE(SUM(download), 0) AS download, "
-                "MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM traffic_samples WHERE ts >= ?",
-                (now - 10,),
-            ).fetchone()
+            sample_time = float(self._state_get("collector_sample_time") or 0)
+            sample_seconds = float(self._state_get("collector_sample_seconds") or 0)
+            fresh = 0 <= now - sample_time <= max(10, min(sample_seconds, 60) * 3 + 2)
+            upload_speed = as_int(self._state_get("collector_upload_speed")) if fresh else 0
+            download_speed = as_int(self._state_get("collector_download_speed")) if fresh else 0
             counts = self.db.execute(
                 "SELECT COUNT(*) AS total, "
                 "SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active, "
@@ -490,7 +499,6 @@ class AuditStore:
                 "FROM connections WHERE start_time <= ? AND last_seen >= ?",
                 (until, since),
             ).fetchone()
-        elapsed = max(1, (recent["last_ts"] or now) - (recent["first_ts"] or now) + 1)
         return {
             "range": range_name,
             "start": utc_iso(since),
@@ -498,8 +506,8 @@ class AuditStore:
             "upload": totals["upload"],
             "download": totals["download"],
             "total": totals["upload"] + totals["download"],
-            "upload_speed": int(recent["upload"] / elapsed),
-            "download_speed": int(recent["download"] / elapsed),
+            "upload_speed": upload_speed,
+            "download_speed": download_speed,
             "connections": counts["total"] or 0,
             "active_connections": counts["active"] or 0,
             "unique_clients": counts["clients"] or 0,
@@ -909,8 +917,10 @@ class Collector:
 
     def status(self):
         with self.lock:
+            running = bool(self.thread and self.thread.is_alive() and not self.stop_event.is_set())
             return {
-                "connected": bool(self.last_success and time.time() - self.last_success <= self.interval * 3 + 2),
+                "running": running,
+                "connected": bool(running and not self.last_error and self.last_success and time.time() - self.last_success <= self.interval * 3 + 2),
                 "last_success": utc_iso(self.last_success),
                 "last_error": self.last_error,
                 "source": self.url,
@@ -934,14 +944,18 @@ class Collector:
             self.last_error = ""
 
     def _run(self):
+        failures = 0
         while not self.stop_event.is_set():
             started = time.monotonic()
             try:
                 self._poll()
-            except (HTTPError, URLError, OSError, ValueError, RuntimeError) as error:
+                failures = 0
+            except (HTTPError, URLError, OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+                failures += 1
                 with self.lock:
                     self.last_error = str(error)
-            wait_for = max(0.2, self.interval - (time.monotonic() - started))
+            retry_interval = min(60, max(self.interval, 2 ** min(failures, 6))) if failures else self.interval
+            wait_for = max(0.2, retry_interval - (time.monotonic() - started))
             self.stop_event.wait(wait_for)
 
 
@@ -999,7 +1013,12 @@ class AuditHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self._json({"ok": True, "service": "sing-box-audit", "version": SERVICE_VERSION, "auth_required": bool(self.server.web_token)})
+            collector = self.server.collector.status()
+            self._json({
+                "ok": True, "service": "sing-box-audit", "version": SERVICE_VERSION,
+                "auth_required": bool(self.server.web_token),
+                "collector_running": collector["running"], "collector_connected": collector["connected"],
+            })
             return
         if parsed.path.startswith("/api/"):
             if not self._require_auth():
