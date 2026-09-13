@@ -534,7 +534,7 @@ main() {
 
     load core.sh
     # create a reality config
-    add reality
+    add reality || exit_and_del_tmpdir
     # wait for background tasks (e.g., OpenRC service start)
     wait
     # enable traffic audit by default for a new installation

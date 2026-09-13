@@ -400,7 +400,7 @@ audit_export() {
     local range=${2:-24h}
     local output=$3
     local view=$4
-    local listen port token url endpoint=export name_part=connections
+    local listen port token url output_tmp endpoint=export name_part=connections
     case $view in
     usage)
         endpoint=usage-export
@@ -419,9 +419,17 @@ audit_export() {
     [[ $listen == 0.0.0.0 ]] && listen=127.0.0.1
     token=$(audit_config_get '.web_token')
     url="http://$listen:$port/api/$endpoint?format=$format&range=$range"
-    if ! _wget -q --header="Authorization: Bearer $token" -O "$output" "$url"; then
-        rm -f "$output"
+    [[ ! -d $output ]] || { err "导出路径不能是目录: $output"; return 1; }
+    output_tmp=$(mktemp "${output}.tmp.XXXXXX") || { err "无法创建导出临时文件."; return 1; }
+    if ! _wget -q --header="Authorization: Bearer $token" -O "$output_tmp" "$url"; then
+        rm -f -- "$output_tmp"
         err "导出失败, 请确认审计服务正在运行."
+        return 1
+    fi
+    if ! mv -f -- "$output_tmp" "$output"; then
+        rm -f -- "$output_tmp"
+        err "保存导出文件失败, 已保留原文件."
+        return 1
     fi
     _green "\n审计数据已导出: $output\n"
 }

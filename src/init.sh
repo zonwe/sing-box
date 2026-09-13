@@ -158,5 +158,5 @@ if [[ -f $is_caddy_bin && -d $is_caddy_dir && $is_caddy_service ]]; then
 fi
 
 load core.sh
-[[ ! $args ]] && args=main
-main $args
+[[ ${#args[@]} -eq 0 ]] && args=(main)
+main "${args[@]}"

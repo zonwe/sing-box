@@ -312,6 +312,44 @@ ask() {
     unset is_opt_msg is_opt_input_msg is_tmp_list is_ask_result is_default_arg is_emtpy_exit
 }
 
+# Validate the combined configuration before replacing a file on the same filesystem.
+write_config() {
+    local target=$1 content=$2 previous=$3
+    (
+        local stage candidate file backup_dir
+        stage=$(mktemp -d "$is_core_dir/.config.XXXXXX") || exit 1
+        trap 'rm -rf -- "$stage"' EXIT
+        mkdir "$stage/conf" || exit 1
+        for file in "$is_conf_dir"/*.json; do
+            [[ -f $file && $file != "$target" && $file != "$previous" ]] || continue
+            cp -p -- "$file" "$stage/conf/" || exit 1
+        done
+        if [[ -f $is_config_json ]]; then
+            cp -p -- "$is_config_json" "$stage/config.json" || exit 1
+        else
+            printf '{}\n' >"$stage/config.json" || exit 1
+        fi
+        if [[ $target == "$is_config_json" ]]; then
+            candidate=$stage/config.json
+        else
+            candidate=$stage/conf/${target##*/}
+        fi
+        printf '%s\n' "$content" >"$candidate" || exit 1
+        if ! jq -e 'type == "object"' "$candidate" &>/dev/null ||
+            ! "$is_core_bin" check -c "$stage/config.json" -C "$stage/conf" &>/dev/null; then
+            err "新配置校验失败, 已保留原配置."
+            exit 1
+        fi
+        backup_dir=$is_core_dir/backups
+        mkdir -p "$backup_dir" && chmod 700 "$backup_dir" || exit 1
+        for file in "$target" "$previous"; do
+            [[ -f $file ]] || continue
+            cp -p -- "$file" "$backup_dir/${file##*/}" && chmod 600 "$backup_dir/${file##*/}" || exit 1
+        done
+        chmod 600 "$candidate" && mv -f -- "$candidate" "$target"
+    )
+}
+
 # create file
 create() {
     case $1 in
@@ -333,7 +371,11 @@ create() {
         # get json
         [[ $is_change || ! $json_str ]] && get protocol $2
         [[ $net == "reality" ]] && is_add_public_key=",outbounds:[{type:\"direct\"},{tag:\"public_key_$is_public_key\",type:\"direct\"}]"
-        is_new_json=$(jq "{inbounds:[{tag:\"$is_config_name\",type:\"$is_protocol\",$is_listen,listen_port:$port,$json_str}]$is_add_public_key}" <<<{})
+        [[ $is_config_name != */* ]] || { err "配置名称不能包含路径分隔符."; return 1; }
+        if ! is_new_json=$(jq "{inbounds:[{tag:\"$is_config_name\",type:\"$is_protocol\",$is_listen,listen_port:$port,$json_str}]$is_add_public_key}" <<<{} 2>/dev/null); then
+            err "生成配置失败, 请检查参数中的特殊字符; 已保留原配置."
+            return 1
+        fi
         [[ $is_test_json ]] && return # tmp test
         # only show json, dont save to file.
         [[ $is_gen ]] && {
@@ -342,13 +384,15 @@ create() {
             msg
             return
         }
-        # del old file
-        [[ $is_config_file ]] && is_no_del_msg=1 && del $is_config_file
-        # save json to file
-        cat <<<$is_new_json >$is_json_file
+        write_config "$is_json_file" "$is_new_json" "${is_config_file:+$is_conf_dir/$is_config_file}" || return 1
+        # Remove a renamed configuration only after its replacement is valid and saved.
+        if [[ $is_config_file && $is_config_file != "$is_config_name" ]]; then
+            is_no_del_msg=1
+            del "$is_config_file"
+        fi
         if [[ $is_new_install ]]; then
             # config.json
-            create config.json
+            create config.json || return 1
         fi
         # caddy auto tls
         [[ $is_caddy && $host && ! $is_no_auto_tls ]] && {
@@ -389,9 +433,11 @@ create() {
             [[ ! $is_ntp_on ]] && is_ntp=
         fi
         is_outbounds='outbounds:[{tag:"direct",type:"direct"}]'
-        is_server_config_json=$(jq "{$is_log,$is_dns,$is_ntp$is_outbounds}" <<<{})
-        [[ $is_experimental ]] && is_server_config_json=$(jq --argjson experimental "$is_experimental" '.experimental = $experimental' <<<$is_server_config_json)
-        cat <<<$is_server_config_json >$is_config_json
+        is_server_config_json=$(jq "{$is_log,$is_dns,$is_ntp$is_outbounds}" <<<{}) || return 1
+        if [[ $is_experimental ]]; then
+            is_server_config_json=$(jq --argjson experimental "$is_experimental" '.experimental = $experimental' <<<"$is_server_config_json") || return 1
+        fi
+        write_config "$is_config_json" "$is_server_config_json" || return 1
         manage restart &
         ;;
     esac
@@ -1062,7 +1108,7 @@ add() {
         # test ss2022 password
         [[ $ss_password ]] && {
             is_test_json=1
-            create server Shadowsocks
+            create server Shadowsocks || return 1
             [[ ! $tmp_uuid ]] && get_uuid
             is_test_json_save=$is_conf_dir/tmp-test-$tmp_uuid
             cat <<<"$is_new_json" >$is_test_json_save
@@ -1085,7 +1131,7 @@ add() {
     fi
 
     # create json
-    create server $is_new_protocol
+    create server $is_new_protocol || return 1
 
     # show config info.
     info
@@ -1782,7 +1828,7 @@ main() {
         ;;
     audit)
         load audit.sh
-        audit_main ${@:2}
+        audit_main "${@:2}"
         ;;
     url | qr)
         url_qr $@
