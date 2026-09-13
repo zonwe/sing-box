@@ -1127,7 +1127,7 @@ add() {
 
     # install caddy
     if [[ $is_install_caddy ]]; then
-        get install-caddy
+        get install-caddy || return 1
     fi
 
     # create json
@@ -1363,7 +1363,7 @@ get() {
     install-caddy)
         _green "\n安装 Caddy 实现自动配置 TLS.\n"
         load download.sh
-        download caddy
+        download caddy || return 1
         load systemd.sh
         install_service caddy &>/dev/null
         is_caddy=1
@@ -1647,10 +1647,9 @@ update() {
         msg "\n发现 $is_show_name 新版本: $(_green $latest_ver)\n"
         is_new_ver=$latest_ver
     fi
-    download $is_update_name $is_new_ver
+    download "$is_update_name" "$is_new_ver" || return 1
     msg "更新成功, 当前 $is_show_name 版本: $(_green $is_new_ver)\n"
     msg "$(_green 请查看更新说明: https://github.com/$is_update_repo/releases/tag/$is_new_ver)\n"
-    [[ $is_update_name != 'sh' ]] && manage restart $is_update_name &
 }
 
 # main menu; if no prefer args.

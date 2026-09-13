@@ -79,7 +79,7 @@ is_audit_database=$is_audit_data_dir/audit.db
 is_audit_server=$is_sh_dir/src/audit/server.py
 is_audit_listen=127.0.0.1
 is_audit_port=9091
-is_pkg="wget tar bash"
+is_pkg="ca-certificates wget tar bash"
 # Alpine: gcompat provides glibc compatibility for prebuilt binaries
 [[ $cmd =~ apk ]] && is_pkg="$is_pkg gcompat jq"
 is_config_json=$is_core_dir/config.json
@@ -94,10 +94,8 @@ tmp_var_lists=(
 )
 
 # tmp dir
-tmpdir=$(mktemp -u)
-[[ ! $tmpdir ]] && {
-    tmpdir=/tmp/tmp-$RANDOM
-}
+tmpdir=$(mktemp -d) || err "无法创建安装临时目录."
+trap 'rm -rf -- "$tmpdir"' EXIT
 
 # set up var
 for i in ${tmp_var_lists[*]}; do
@@ -109,10 +107,10 @@ load() {
     . $is_sh_dir/src/$1
 }
 
-# wget add --no-check-certificate
+# Install CA certificates before using verified HTTPS downloads.
 _wget() {
     [[ $proxy ]] && export https_proxy=$proxy
-    wget --no-check-certificate $*
+    wget "$@"
 }
 
 # print a mesage
@@ -168,7 +166,11 @@ validate_audit_listen_arg() {
 install_pkg() {
     cmd_not_found=
     for i in $*; do
-        [[ ! $(type -P $i) ]] && cmd_not_found="$cmd_not_found,$i"
+        if [[ $i == ca-certificates ]]; then
+            [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/pki/tls/certs/ca-bundle.crt || -s /etc/ssl/ca-bundle.pem ]] || cmd_not_found="$cmd_not_found,$i"
+        else
+            [[ ! $(type -P "$i") ]] && cmd_not_found="$cmd_not_found,$i"
+        fi
     done
     if [[ $cmd_not_found ]]; then
         pkg=$(echo $cmd_not_found | sed 's/,/ /g')
@@ -196,6 +198,7 @@ install_pkg() {
 
 # download file
 download() {
+    local link name tmpfile is_ok expected actual checksum
     case $1 in
     core)
         [[ ! $is_core_ver ]] && is_core_ver=$(_wget -qO- "https://api.github.com/repos/${is_core_repo}/releases/latest?v=$RANDOM" | grep tag_name | grep -E -o 'v([0-9.]+)')
@@ -220,8 +223,29 @@ download() {
 
     [[ $link ]] && {
         msg warn "下载 ${name} > ${link}"
-        if _wget -t 3 -q -c $link -O $tmpfile; then
-            mv -f $tmpfile $is_ok
+        if _wget -t 3 -T 30 -q "$link" -O "$tmpfile"; then
+            if [[ $1 == jq ]]; then
+                # jq 1.7.1 official sha256sum.txt, pinned with the download version.
+                case $is_arch in
+                amd64) expected=5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5 ;;
+                arm64) expected=4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5 ;;
+                esac
+                actual=$(sha256sum "$tmpfile") || return 1
+                [[ ${actual%% *} == "$expected" ]] || { msg err "jq SHA-256 校验失败."; return 1; }
+            else
+                validate_archive "$tmpfile" || { msg err "${name} 下载包校验失败."; return 1; }
+                if [[ $1 == sh ]]; then
+                    checksum=$tmpfile.sha256
+                    if _wget -q -t 2 -T 15 "$link.sha256" -O "$checksum"; then
+                        read -r expected _ <"$checksum"
+                        actual=$(sha256sum "$tmpfile") || return 1
+                        [[ $expected =~ ^[[:xdigit:]]{64}$ && ${actual%% *} == "$expected" ]] || { msg err "脚本包 SHA-256 校验失败."; return 1; }
+                    else
+                        msg warn "此版本未提供校验摘要, 将使用 TLS 和包结构校验."
+                    fi
+                fi
+            fi
+            mv -f -- "$tmpfile" "$is_ok"
         fi
     }
 }
@@ -353,6 +377,118 @@ pass_args() {
     }
 }
 
+# Bootstrap copies of src/download.sh helpers: keep both entry points compatible with older releases.
+validate_archive() {
+    local archive=$1 member listing
+    listing=$(tar tzf "$archive") || return 1
+    while IFS= read -r member; do
+        case $member in
+        /* | .. | ../* | */../* | */..)
+            return 1
+            ;;
+        esac
+    done <<<"$listing"
+    listing=$(tar tvzf "$archive") || return 1
+    # Release packages contain ordinary files/directories, never links outside the stage.
+    [[ ! $(grep -E '^[lh]' <<<"$listing") ]]
+}
+
+validate_scripts() {
+    local directory=$1 file
+    [[ -s $directory/sing-box.sh && -s $directory/src/init.sh && -s $directory/src/core.sh ]] || return 1
+    for file in "$directory"/*.sh "$directory"/src/*.sh; do
+        [[ -f $file ]] || continue
+        bash -n "$file" || return 1
+    done
+    if [[ -f $directory/src/audit/server.py ]] && type -P python3 &>/dev/null; then
+        python3 -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$directory/src/audit/server.py" || return 1
+    fi
+    chmod +x "$directory/sing-box.sh"
+}
+
+update_service_running() {
+    [[ $1 ]] || return 1
+    if [[ $is_systemd ]]; then
+        systemctl is-active --quiet "$1"
+    elif [[ $is_openrc ]]; then
+        rc-service "$1" status &>/dev/null
+    else
+        return 1
+    fi
+}
+
+update_service_restart() {
+    local service=$1 attempt listen port
+    if [[ $is_systemd ]]; then
+        systemctl restart "$service" || return 1
+    elif [[ $is_openrc ]]; then
+        rc-service "$service" restart || return 1
+    else
+        return 1
+    fi
+    for attempt in 1 2 3 4 5; do
+        sleep 1
+        update_service_running "$service" || continue
+        if [[ $service == "$is_audit_name" ]]; then
+            listen=$(jq -r '.listen' "$is_audit_config")
+            port=$(jq -r '.port' "$is_audit_config")
+            [[ $listen == 0.0.0.0 ]] && listen=127.0.0.1
+            _wget --no-proxy -qO- -t 1 -T 2 "http://$listen:$port/api/health" | jq -e '.ok == true' &>/dev/null || continue
+        fi
+        return 0
+    done
+    return 1
+}
+
+install_update() {
+    local source=$1 target=$2 service=$3
+    (
+        local work old_exists=0 changed=0 running=0 result rollback_failed=0
+        work=$(mktemp -d "${target%/*}/.update.XXXXXX") || exit 1
+        trap '
+            result=$?
+            if [[ $result != 0 && $changed == 1 ]]; then
+                if [[ -d $target ]]; then
+                    mv -- "$target" "$work/failed" || rollback_failed=1
+                fi
+                if [[ $old_exists == 1 ]]; then
+                    mv -f -- "$work/previous" "$target" || rollback_failed=1
+                elif [[ -f $target ]]; then
+                    rm -f -- "$target" || rollback_failed=1
+                fi
+                if [[ $running == 1 && $rollback_failed == 0 ]]; then
+                    update_service_restart "$service" || printf "恢复后的服务未启动, 请检查: %s\n" "$service" >&2
+                fi
+            fi
+            if [[ $rollback_failed == 0 ]]; then
+                rm -rf -- "$work"
+            else
+                printf "自动恢复失败, 备份保留在: %s\n" "$work" >&2
+            fi
+            exit "$result"
+        ' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        cp -a -- "$source" "$work/new" || exit 1
+        update_service_running "$service" && running=1
+        if [[ -e $target ]]; then
+            old_exists=1
+            if [[ -d $target ]]; then
+                mv -- "$target" "$work/previous" || exit 1
+                changed=1
+            else
+                cp -p -- "$target" "$work/previous" || exit 1
+            fi
+        fi
+        mv -f -- "$work/new" "$target" || exit 1
+        changed=1
+        if [[ $running == 1 ]]; then
+            update_service_restart "$service" || exit 1
+        fi
+        exit 0
+    )
+}
+
 # update installed management scripts without reinstalling sing-box
 update_script_only() {
     [[ ! -f $is_sh_bin || ! -d $is_sh_dir ]] && {
@@ -360,7 +496,7 @@ update_script_only() {
     }
 
     mkdir -p "$tmpdir"
-    install_pkg "wget tar bash"
+    install_pkg "ca-certificates wget tar bash"
     [[ ! -f $is_pkg_ok ]] && {
         err "安装更新依赖失败."
     }
@@ -370,10 +506,10 @@ update_script_only() {
     [[ ! -f $is_sh_ok ]] && {
         err "下载 ${is_core_name} 脚本失败."
     }
-    tar tzf "$is_sh_ok" &>/dev/null || err "下载的脚本包无法通过校验."
-    tar zxf "$is_sh_ok" -C "$is_sh_dir" || err "更新 ${is_core_name} 脚本失败."
-    chmod +x "$is_sh_dir/$is_core.sh" "$is_sh_bin" "${is_sh_bin/$is_core/sb}"
-    rm -rf "$tmpdir"
+    mkdir "$tmpdir/scripts" || err "无法创建脚本暂存目录."
+    tar zxf "$is_sh_ok" -C "$tmpdir/scripts" || err "下载的脚本包无法解压."
+    validate_scripts "$tmpdir/scripts" || err "下载的脚本包无法通过校验."
+    install_update "$tmpdir/scripts" "$is_sh_dir" "$is_audit_name" || err "更新失败, 已尝试恢复原脚本, 请检查服务状态."
     msg ok "管理脚本更新完成; 配置和审计数据均已保留."
     exit 0
 }
@@ -396,7 +532,7 @@ main() {
 
     # check parameters before detecting an existing installation so that
     # --script-update can migrate installations from the upstream script.
-    [[ $# -gt 0 ]] && pass_args $@
+    [[ $# -gt 0 ]] && pass_args "$@"
     [[ $script_update ]] && update_script_only
 
     # check old version
@@ -442,8 +578,9 @@ main() {
         apk add $is_pkg &>/dev/null
         [[ $? == 0 ]] && >$is_pkg_ok
     else
-        install_pkg $is_pkg &
+        install_pkg $is_pkg
     fi
+    [[ -f $is_pkg_ok ]] || exit_and_del_tmpdir
 
     # jq
     if [[ $(type -P jq) ]]; then
@@ -468,7 +605,8 @@ main() {
     # test $is_core_file
     if [[ $is_core_file ]]; then
         mkdir -p $tmpdir/testzip
-        tar zxf $is_core_ok --strip-components 1 -C $tmpdir/testzip &>/dev/null
+        validate_archive "$is_core_ok" || exit_and_del_tmpdir
+        tar zxf "$is_core_ok" --strip-components 1 -C "$tmpdir/testzip" &>/dev/null
         [[ $? != 0 ]] && {
             msg err "${is_core_name} 文件无法通过测试."
             exit_and_del_tmpdir
@@ -490,18 +628,19 @@ main() {
 
     # copy sh file or unzip sh zip file.
     if [[ $local_install ]]; then
-        cp -rf $PWD/* $is_sh_dir
+        cp -rf "$PWD/"* "$is_sh_dir" || exit_and_del_tmpdir
     else
-        tar zxf $is_sh_ok -C $is_sh_dir
+        tar zxf "$is_sh_ok" -C "$is_sh_dir" || exit_and_del_tmpdir
     fi
+    validate_scripts "$is_sh_dir" || exit_and_del_tmpdir
 
     # create core bin dir
     mkdir -p $is_core_dir/bin
     # copy core file or unzip core zip file
     if [[ $is_core_file ]]; then
-        cp -rf $tmpdir/testzip/* $is_core_dir/bin
+        cp -rf "$tmpdir/testzip/"* "$is_core_dir/bin" || exit_and_del_tmpdir
     else
-        tar zxf $is_core_ok --strip-components 1 -C $is_core_dir/bin
+        tar zxf "$is_core_ok" --strip-components 1 -C "$is_core_dir/bin" || exit_and_del_tmpdir
     fi
 
     # add alias
@@ -547,4 +686,4 @@ main() {
 }
 
 # start.
-main $@
+main "$@"

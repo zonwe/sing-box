@@ -89,6 +89,12 @@ bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/inst
 也不会删除已有审计数据库。若原配置尚未启用 Clash API，`audit enable` 会添加仅监听本机的
 管理接口并重启一次 sing-box。迁移后可继续使用 `sing-box update.sh` 获取本仓库的新版本。
 
+下载默认验证 HTTPS 证书，安装器会先准备 `ca-certificates`。脚本更新会检查包结构、Bash
+语法和可用的 SHA-256 摘要，核心更新会先用新核心检查当前配置；通过后再替换文件。
+更新前正在运行的服务会重启并检查状态，失败时尝试恢复原版本；已停止的服务保持停止。
+审计运行期间更新脚本也会重启审计服务，使页面和后端一起生效。旧发布包没有摘要时，
+会明确提示并使用 TLS 与包结构校验；证书错误应修复系统时间或 CA 配置后重试。
+
 # 文档
 
 - 流量审计：[部署与使用文档](docs/traffic-audit.md)

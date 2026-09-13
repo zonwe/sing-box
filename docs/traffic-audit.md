@@ -533,7 +533,7 @@ sing-box audit status
 
 ### 8.4 更新和重装的区别
 
-- `sing-box update.sh`：更新脚本，保留审计配置和数据库。
+- `sing-box update.sh`：校验后更新脚本，保留审计配置和数据库；运行中的审计服务会重启并检查健康接口，失败时尝试恢复原脚本，已停止的服务保持停止。
 - `sing-box update core`：更新并重启核心；审计服务识别计数器回退并继续累计。
 - `sing-box audit disable`：停止并取消开机启动，但保留配置和数据库。
 - `sing-box audit uninstall`：确认后删除审计服务、配置和全部数据库。
