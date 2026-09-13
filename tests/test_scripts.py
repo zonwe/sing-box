@@ -115,6 +115,46 @@ create server Trojan
         self.assertEqual((self.root / "backups" / "old.json").read_text(), self.original)
         self.assertEqual(list(self.root.glob(".config.*")), [])
 
+    def test_bulk_repair_validates_each_candidate_and_checks_all_before_restart(self):
+        script = functions("src/core.sh", "write_config", "main") + '''
+fake_core() {
+    local file
+    if [[ $# == 3 ]]; then
+        jq -e '.repaired == true' "$3" >/dev/null
+    else
+        for file in "$5"/*.json; do
+            jq -e '.repaired == true' "$file" >/dev/null || return 1
+        done
+    fi
+}
+change() {
+    local content='{"repaired":true}'
+    [[ $FAIL_REPAIR == 1 && $1 == second.json ]] && content='{"repaired":false}'
+    write_config "$is_conf_dir/$1" "$content"
+}
+manage() { printf 'restart\n' >"$is_core_dir/service.log"; }
+main fix-all
+result=$?
+wait
+exit "$result"
+'''
+        for fail in ("0", "1"):
+            with self.subTest(fail=fail):
+                for name in ("old.json", "second.json"):
+                    (self.conf / name).write_text('{"repaired":false}')
+                log = self.root / "service.log"
+                if log.exists():
+                    log.unlink()
+                result = self.run_shell(script, FAIL_REPAIR=fail)
+                if fail == "0":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(log.exists())
+                    self.assertTrue(json.loads((self.conf / "second.json").read_text())["repaired"])
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(log.exists())
+                    self.assertFalse(json.loads((self.conf / "second.json").read_text())["repaired"])
+
     def test_export_failure_preserves_report_and_success_replaces_it(self):
         output = self.root / "report with spaces.json"
         script = functions("src/audit.sh", "audit_export") + '''

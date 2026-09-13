@@ -335,8 +335,13 @@ write_config() {
             candidate=$stage/conf/${target##*/}
         fi
         printf '%s\n' "$content" >"$candidate" || exit 1
+        local check_args=(check -c "$stage/config.json" -C "$stage/conf")
+        if [[ $is_batch_config_check && $target != "$is_config_json" ]]; then
+            # fix-all must be able to repair several incompatible files in one pass.
+            check_args=(check -c "$candidate")
+        fi
         if ! jq -e 'type == "object"' "$candidate" &>/dev/null ||
-            ! "$is_core_bin" check -c "$stage/config.json" -C "$stage/conf" &>/dev/null; then
+            ! "$is_core_bin" "${check_args[@]}" &>/dev/null; then
             err "新配置校验失败, 已保留原配置."
             exit 1
         fi
@@ -1767,11 +1772,18 @@ main() {
             ;;
         fix-all)
             is_dont_auto_exit=1
+            is_batch_config_check=1
             msg
             for v in $(ls $is_conf_dir | grep .json$ | sed '/dynamic-port-.*-link/d'); do
                 msg "fix: $v"
                 change $v full
             done
+            unset is_batch_config_check
+            if ! "$is_core_bin" check -c "$is_config_json" -C "$is_conf_dir" &>/dev/null; then
+                is_dont_auto_exit=
+                err "批量修复后的完整配置校验失败, 未重启服务; 原配置备份位于 $is_core_dir/backups."
+                return 1
+            fi
             _green "\nfix 完成.\n"
             ;;
         *)
