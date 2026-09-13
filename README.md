@@ -97,6 +97,12 @@ bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/inst
 
 # 文档
 
+普通分支 push 和 Pull Request 会运行 Bash／JavaScript 语法检查及隔离回归测试，不会发布。
+发布时需先更新 `sing-box.sh` 中的 `is_sh_ver`，再创建名称完全一致的新版本 tag（例如
+`v1.19`）；检查通过后会发布 `code.tar.gz` 和 `code.tar.gz.sha256`，已有 Release 不会被覆盖。
+本地回归测试需要 Bash、Python 3 和 jq，运行 `python3 -B -m unittest discover -s tests -v`；
+测试只使用临时目录、模拟服务和回环 HTTP 接口。
+
 - 流量审计：[部署与使用文档](docs/traffic-audit.md)
 - 原脚本安装及使用：https://233boy.com/sing-box/sing-box-script/
 

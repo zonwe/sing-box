@@ -1,31 +1,63 @@
-name: Main
+name: Check and release
 
-on: push
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
 
 permissions:
-  contents: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  build:
+  check:
     runs-on: ubuntu-latest
     steps:
-      - name: checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-      - name: get ver
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Prepare test dependencies
         run: |
-          echo "$(cat *.sh | grep is_sh_ver=)" >> $GITHUB_ENV
-          echo "old=$(git tag | tail -n1)" >> $GITHUB_ENV
-      # - name: test
-      #   if: env.is_sh_ver == env.old 
-      #   run: |
-      #     echo not found new version.
-      #     exit 1
-      - name: tar
-        run: tar zcvf code.tar.gz ./*
-      - name: release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: code.tar.gz
-          tag_name: ${{ env.is_sh_ver }}
+          sudo apt-get update
+          sudo apt-get install -y jq
+      - name: Check shell and JavaScript syntax
+        run: |
+          for script in install.sh sing-box.sh src/*.sh; do
+            bash -n "$script"
+          done
+          node --check src/audit/web/app.js
+      - name: Run isolated regression tests
+        run: python3 -B -m unittest discover -s tests -v
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^is_sh_ver=//p' sing-box.sh)
+          if [[ ! $version =~ ^v[0-9]+(\.[0-9]+)+$ || $version != "$RELEASE_TAG" ]]; then
+            printf 'Tag %s must match is_sh_ver (%s)\n' "$RELEASE_TAG" "$version" >&2
+            exit 1
+          fi
+      - name: Package runtime files and checksum
+        run: |
+          git archive --format=tar HEAD install.sh sing-box.sh src README.md LICENSE docs | gzip -n > code.tar.gz
+          sha256sum code.tar.gz > code.tar.gz.sha256
+      - name: Publish a new release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" code.tar.gz code.tar.gz.sha256 \
+            --verify-tag --title "$RELEASE_TAG" --generate-notes
