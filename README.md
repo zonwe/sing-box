@@ -52,7 +52,7 @@
 在受支持的 Linux 服务器上以 `root` 身份执行：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/install.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/zonwe/sing-box/main/install.sh)
 ```
 
 无需克隆整个仓库。安装器会从本仓库的 GitHub Release 下载所需脚本，并继续使用原来的
@@ -62,13 +62,13 @@ bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/inst
 如需自定义审计监听地址或端口：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/install.sh) --audit-listen 0.0.0.0 --audit-port 9091
+bash <(wget -qO- https://raw.githubusercontent.com/zonwe/sing-box/main/install.sh) --audit-listen 0.0.0.0 --audit-port 9091
 ```
 
 `0.0.0.0` 会将无 TLS 的页面暴露到网络，请配合防火墙或反向代理限制访问。如不需要审计：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/install.sh) --no-audit
+bash <(wget -qO- https://raw.githubusercontent.com/zonwe/sing-box/main/install.sh) --no-audit
 ```
 
 ## 已安装原版脚本
@@ -76,13 +76,13 @@ bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/inst
 如果服务器已经使用 `233boy/sing-box` 安装，执行下面的一条命令即可更新管理脚本并启用审计：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/install.sh) --script-update && sing-box audit enable
+bash <(wget -qO- https://raw.githubusercontent.com/zonwe/sing-box/main/install.sh) --script-update && sing-box audit enable
 ```
 
 如需迁移时直接监听指定地址和端口，可把最后一段改为：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/install.sh) --script-update && sing-box audit enable 0.0.0.0 9091
+bash <(wget -qO- https://raw.githubusercontent.com/zonwe/sing-box/main/install.sh) --script-update && sing-box audit enable 0.0.0.0 9091
 ```
 
 这个操作只覆盖 `/etc/sing-box/sh` 中的管理脚本，不重装 sing-box，不修改现有代理配置，
@@ -100,6 +100,8 @@ bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/inst
 普通分支 push 和 Pull Request 会运行 Bash／JavaScript 语法检查及隔离回归测试，不会发布。
 发布时需先更新 `sing-box.sh` 中的 `is_sh_ver`，再创建名称完全一致的新版本 tag（例如
 `v1.19`）；检查通过后会发布 `code.tar.gz` 和 `code.tar.gz.sha256`，已有 Release 不会被覆盖。
+在线更新读取最新 Release，不直接安装 `main` 分支的源码；如果只推送了提交而没有发布新
+版本，`--script-update` 仍会安装旧发布包，`sing-box update.sh` 也可能提示已经是最新版本。
 本地回归测试需要 Bash、Python 3 和 jq，运行 `python3 -B -m unittest discover -s tests -v`；
 测试只使用临时目录、模拟服务和回环 HTTP 接口。
 
@@ -172,7 +174,7 @@ Usage: sing-box [options]... [args]...
    h, help                                         显示此帮助界面
 
 谨慎使用 del, ddel, 此选项会直接删除配置; 无需确认
-反馈问题) https://github.com/WangzyaaaA/sing-box/issues
+反馈问题) https://github.com/zonwe/sing-box/issues
 文档(doc) https://233boy.com/sing-box/sing-box-script/
 ```
 

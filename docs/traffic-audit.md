@@ -105,7 +105,7 @@ python3 -c 'import sqlite3; print(sqlite3.sqlite_version)'
 在受支持的 Linux 服务器上以 root 身份执行一键安装：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/install.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/zonwe/sing-box/main/install.sh)
 ```
 
 无需下载整个仓库。`install.sh` 会从本仓库的 GitHub Release 下载发布包。
@@ -114,19 +114,19 @@ bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/inst
 如需在安装时自定义监听地址和端口：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/install.sh) --audit-listen 0.0.0.0 --audit-port 9091
+bash <(wget -qO- https://raw.githubusercontent.com/zonwe/sing-box/main/install.sh) --audit-listen 0.0.0.0 --audit-port 9091
 ```
 
 如不需要审计，可显式关闭默认行为：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/install.sh) --no-audit
+bash <(wget -qO- https://raw.githubusercontent.com/zonwe/sing-box/main/install.sh) --no-audit
 ```
 
 如需审查源码或进行本地修改，也可以获取完整仓库后安装：
 
 ```bash
-git clone https://github.com/WangzyaaaA/sing-box.git
+git clone https://github.com/zonwe/sing-box.git
 cd sing-box
 bash install.sh --local-install
 ```
@@ -140,7 +140,7 @@ bash install.sh --local-install
 执行下面的一次性迁移，把管理脚本更新源切换到本仓库：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/WangzyaaaA/sing-box/main/install.sh) --script-update
+bash <(wget -qO- https://raw.githubusercontent.com/zonwe/sing-box/main/install.sh) --script-update
 sing-box audit enable
 ```
 
@@ -148,6 +148,10 @@ sing-box audit enable
 `/etc/sing-box/conf` 中的代理配置，也不会删除 `/etc/sing-box/audit` 或
 `/var/lib/sing-box-audit` 中的配置和数据库。迁移后再执行 `sing-box update.sh` 时，
 脚本会从本仓库获取更新。
+
+在线更新下载的是最新 Release 的 `code.tar.gz`，不是 `main` 分支源码。仅推送提交不会
+更新发布包；维护者需要提升脚本版本号并发布同名 tag，等待检查通过和发布完成。如果
+服务端提示“当前已经是最新版本”，请先确认新版本 Release 已发布，再执行更新命令。
 
 ### 3.3 已安装服务器：部署当前本地源码
 
