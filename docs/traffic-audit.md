@@ -248,7 +248,7 @@ curl http://127.0.0.1:9091/api/health
 预期返回类似：
 
 ```json
-{"ok":true,"service":"sing-box-audit","version":"1.2.0","auth_required":true}
+{"ok":true,"service":"sing-box-audit","version":"1.3.0","auth_required":true}
 ```
 
 ## 5. 访问 Web 仪表盘
@@ -326,11 +326,14 @@ server {
 不会挤占主要图表的展示空间。
 
 速率使用最近一次成功采集的字节增量除以实际采集间隔；首次采集仅建立基线，长时间没有
-新样本时速率显示为零。网络或 SQLite 错误会触发自动重试，连续失败时退避至最多 60 秒，
+新样本时速率显示为零。网络或 SQLite 错误会触发自动重试，连续失败时退避至最多 15 秒，
 成功后恢复设置的采集间隔。`/api/health` 中的 `ok` 表示 Web 服务可访问，
-`collector_running` 和 `collector_connected` 分别表示采集线程存活及最近采集正常。
+`collector_running`、`collector_connected` 和 `collector_failures` 分别表示采集线程存活、
+最近采集正常以及连续失败次数。`/api/health` 和 `/api/summary` 都带 `version`，可用于
+确认服务器上运行的服务版本。
 
-页面每 5 秒刷新一次；采集服务默认每 1 秒读取一次 sing-box 状态。页面关闭不会停止采集，
+页面每 5 秒刷新一次，并且只会在上一轮请求结束后再排下一次，因此单轮变慢不会叠加并发；
+采集服务默认每 1 秒读取一次 sing-box 状态。页面关闭不会停止采集，
 只要 `sing-box-audit` 服务运行，数据就会继续写入 SQLite。
 
 ## 7. 命令行使用
@@ -687,6 +690,38 @@ sing-box audit purge 30
 
 SQLite 删除旧行后文件尺寸不一定立即缩小，但已删除空间会被后续记录复用。不要在服务
 运行时直接删除 `audit.db-wal` 或 `audit.db-shm`。
+
+### 10.7 页面偶尔提示连接失败或采集异常
+
+右上角和右下角是两个不同的状态，先区分再排查：
+
+| 位置 | 提示 | 含义 |
+| --- | --- | --- |
+| 右上角 | 采集异常 | 浏览器能访问审计服务，但审计服务读不到 sing-box 的 Clash API |
+| 右上角 | 服务异常 | 浏览器请求审计服务失败，页面顶部鼠标悬停可看到具体原因 |
+| 右下角 | 无法连接审计服务 | 请求没有拿到响应：服务正在重启、SSH 转发或反向代理中断 |
+| 右下角 | 请求失败 (500) | 服务端内部错误，`journalctl` 中同时会有 `请求处理失败` 与 traceback |
+
+排查命令：
+
+```bash
+sing-box audit status
+curl -s http://127.0.0.1:9091/api/health
+journalctl -u sing-box-audit -n 200 --no-pager
+```
+
+- 出现 `请求处理失败` 与 traceback：这是服务端内部错误，日志中的异常类型和位置就是原因；
+  反馈问题时请一并提供。
+- 只有 unit 启动或停止记录、没有 traceback：服务在重启。`sing-box audit set`、
+  `audit enable` 以及脚本或核心更新都会重启审计服务，期间页面提示属于预期现象。
+- `collector_connected` 为 `false` 且 `collector_failures` 持续增长：问题在
+  sing-box 侧，按 10.4 排查；连续失败时重试间隔最多退避到 15 秒，成功一次即恢复。
+- `sing-box audit purge` 会与正在运行的服务同时写入同一个数据库，可能让采集短暂失败并
+  显示采集异常，建议改在流量低谷执行。
+
+V1.3.0 起，服务端异常会返回 JSON 错误而不是直接断开连接，仪表盘因此不再出现浏览器原生的
+`Failed to fetch`；同时服务端使用 HTTP/1.1 keep-alive 并扩大了连接队列，页面轮询也不会
+再叠加并发请求。如果升级后仍看到 `Failed to fetch`，请确认为 10.2 中的转发或代理问题。
 
 ## 11. 禁用与卸载
 

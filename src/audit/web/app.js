@@ -3,7 +3,7 @@
 const state = {
   token: sessionStorage.getItem("auditToken") || "", range: "24h", customStart: "", customEnd: "",
   page: 1, pages: 1, usagePage: 1, usagePages: 1, configUsagePage: 1, configUsagePages: 1,
-  timer: null, detailsLoading: false, series: [], flowItems: [], chartHover: null,
+  timer: null, dashboardLoading: false, detailsLoading: false, series: [], flowItems: [], chartHover: null,
 };
 const $ = (id) => document.getElementById(id);
 const rangeLabels = { "1h": "最近 1 小时", "6h": "最近 6 小时", "24h": "最近 24 小时", "7d": "最近 7 天", "30d": "最近 30 天", all: "全部时间" };
@@ -53,17 +53,47 @@ function shortLabel(value, length = 16) {
   return label.length > length ? `${label.slice(0, length - 1)}…` : label;
 }
 
+const requestTimeout = 12000;
+
+// Browsers describe network-level failures with opaque English messages such as
+// "Failed to fetch". Translate them so the status text stays actionable.
+function failureMessage(error) {
+  const message = String((error && error.message) || "");
+  if (error && error.name === "AbortError") return "请求超时";
+  if (/failed to fetch|networkerror|load failed|network error/i.test(message)) return "无法连接审计服务";
+  return message || "无法连接审计服务";
+}
+
+// Fire-and-forget user actions still need a visible failure instead of an
+// unhandled promise rejection in the console.
+function runAction(promise) {
+  promise.catch((error) => toast(failureMessage(error)));
+}
+
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
   if (state.token) headers.set("Authorization", `Bearer ${state.token}`);
-  const response = await fetch(path, { ...options, headers, cache: "no-store" });
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), requestTimeout);
+  let response;
+  try {
+    response = await fetch(path, { ...options, headers, cache: "no-store", signal: controller.signal });
+  } catch (error) {
+    throw new Error(failureMessage(error));
+  } finally {
+    window.clearTimeout(timer);
+  }
   if (response.status === 401) {
     sessionStorage.removeItem("auditToken");
     showTokenDialog();
     throw new Error("访问令牌无效");
   }
   if (!response.ok) throw new Error(`请求失败 (${response.status})`);
-  return response.json();
+  try {
+    return await response.json();
+  } catch (error) {
+    throw new Error("审计服务返回了无效数据");
+  }
 }
 
 function showTokenDialog(message = "") {
@@ -72,27 +102,54 @@ function showTokenDialog(message = "") {
   if (!dialog.open) dialog.showModal();
 }
 
+// Schedule the next refresh only once the current round has finished, so a slow
+// response cannot stack parallel rounds on top of each other.
 function startRefreshTimer() {
-  if (state.timer) window.clearInterval(state.timer);
-  state.timer = window.setInterval(() => loadDashboard(), 5000);
+  if (state.timer) window.clearTimeout(state.timer);
+  state.timer = window.setTimeout(async () => {
+    await loadDashboard();
+    startRefreshTimer();
+  }, 5000);
 }
 
+let lastToast = { message: "", at: 0 };
+
 function toast(message) {
+  const text = String(message || "");
+  const now = Date.now();
+  if (text === lastToast.message && now - lastToast.at < 5000) return;
+  lastToast = { message: text, at: now };
   const element = $("toast");
-  element.textContent = message;
+  element.textContent = text;
   element.classList.add("show");
   window.setTimeout(() => element.classList.remove("show"), 2200);
+}
+
+function collectorDetail(collector) {
+  const reason = (collector && collector.last_error) || "无法连接 sing-box API";
+  const failures = Number(collector && collector.failures) || 0;
+  return failures > 1 ? `${reason} · 已连续失败 ${failures} 次，重试中` : reason;
 }
 
 function setHealth(collector) {
   const element = $("health");
   const connected = Boolean(collector && collector.connected);
+  const detail = connected ? `每 ${collector.interval} 秒采集` : collectorDetail(collector);
   element.className = `health ${connected ? "ok" : "error"}`;
   element.querySelector("span").textContent = connected ? "采集正常" : "采集异常";
-  element.title = connected ? `每 ${collector.interval} 秒采集` : ((collector && collector.last_error) || "无法连接 sing-box API");
+  element.title = detail;
   $("collectorStatus").textContent = connected ? "采集正常" : "采集异常";
-  $("collectorCopy").textContent = connected ? `所有节点正常 · 每 ${collector.interval} 秒更新` : ((collector && collector.last_error) || "无法连接 sing-box API");
+  $("collectorCopy").textContent = connected ? `所有节点正常 · 每 ${collector.interval} 秒更新` : detail;
   document.querySelector(".pulse-panel").classList.toggle("error", !connected);
+}
+
+// The browser cannot reach the audit service at all: a different failure than
+// the collector failing to read the sing-box Clash API.
+function setServiceHealth(message) {
+  const element = $("health");
+  element.className = "health error";
+  element.querySelector("span").textContent = "服务异常";
+  element.title = message || "无法连接审计服务";
 }
 
 function renderSummary(data) {
@@ -515,6 +572,8 @@ async function loadDetailData() {
 }
 
 async function loadDashboard(showNotice = false) {
+  if (state.dashboardLoading) return;
+  state.dashboardLoading = true;
   try {
     const query = timeParams();
     const activityQuery = new URLSearchParams(query);
@@ -542,10 +601,13 @@ async function loadDashboard(showNotice = false) {
     if (showNotice) toast("数据已刷新");
   } catch (error) {
     if (error.message !== "访问令牌无效") {
-      $("health").className = "health error";
-      $("health").querySelector("span").textContent = "服务异常";
-      toast(error.message);
+      setServiceHealth(error.message);
+      // Background refreshes already report the problem in the header, so only
+      // surface the toast for a refresh the user explicitly asked for.
+      if (showNotice) toast(error.message);
     }
+  } finally {
+    state.dashboardLoading = false;
   }
 }
 
@@ -557,7 +619,7 @@ function downloadConnections(format) {
   fetch(`/api/export?${params}`, { headers: { Authorization: `Bearer ${state.token}` } })
     .then((response) => { if (!response.ok) throw new Error("导出失败"); const disposition = response.headers.get("Content-Disposition") || ""; const name = disposition.match(/filename="([^"]+)"/)?.[1] || `sing-box-audit.${format}`; return Promise.all([response.blob(), name]); })
     .then(([blob, name]) => { const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = name; link.click(); URL.revokeObjectURL(url); toast(`已导出 ${format.toUpperCase()}`); })
-    .catch((error) => toast(error.message));
+    .catch((error) => toast(failureMessage(error)));
 }
 
 function downloadUsage(format) {
@@ -568,7 +630,7 @@ function downloadUsage(format) {
   fetch(`/api/usage-export?${params}`, { headers: { Authorization: `Bearer ${state.token}` } })
     .then((response) => { if (!response.ok) throw new Error("导出失败"); const disposition = response.headers.get("Content-Disposition") || ""; const name = disposition.match(/filename="([^"]+)"/)?.[1] || `sing-box-audit-usage.${format}`; return Promise.all([response.blob(), name]); })
     .then(([blob, name]) => { const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = name; link.click(); URL.revokeObjectURL(url); toast(`已导出 IP / 配置用量 ${format.toUpperCase()}`); })
-    .catch((error) => toast(error.message));
+    .catch((error) => toast(failureMessage(error)));
 }
 
 function downloadConfigUsage(format) {
@@ -579,7 +641,7 @@ function downloadConfigUsage(format) {
   fetch(`/api/config-usage-export?${params}`, { headers: { Authorization: `Bearer ${state.token}` } })
     .then((response) => { if (!response.ok) throw new Error("导出失败"); const disposition = response.headers.get("Content-Disposition") || ""; const name = disposition.match(/filename="([^"]+)"/)?.[1] || `sing-box-audit-config-usage.${format}`; return Promise.all([response.blob(), name]); })
     .then(([blob, name]) => { const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = name; link.click(); URL.revokeObjectURL(url); toast(`已导出配置文件用量 ${format.toUpperCase()}`); })
-    .catch((error) => toast(error.message));
+    .catch((error) => toast(failureMessage(error)));
 }
 
 let searchTimer;
@@ -605,24 +667,24 @@ $("applyRange").addEventListener("click", () => {
   loadDashboard(true);
 });
 $("refresh").addEventListener("click", () => loadDashboard(true));
-$("protocol").addEventListener("change", () => { state.page = 1; loadConnections(); });
-$("status").addEventListener("change", () => { state.page = 1; loadConnections(); });
-$("search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.page = 1; loadConnections(); }, 280); });
-$("usageSearch").addEventListener("input", () => { clearTimeout(usageSearchTimer); usageSearchTimer = setTimeout(() => { state.usagePage = 1; loadUsage(); }, 280); });
-$("configUsageSearch").addEventListener("input", () => { clearTimeout(configUsageSearchTimer); configUsageSearchTimer = setTimeout(() => { state.configUsagePage = 1; loadConfigUsage(); }, 280); });
-$("prevPage").addEventListener("click", () => { if (state.page > 1) { state.page -= 1; loadConnections(); } });
-$("nextPage").addEventListener("click", () => { if (state.page < state.pages) { state.page += 1; loadConnections(); } });
-$("usagePrevPage").addEventListener("click", () => { if (state.usagePage > 1) { state.usagePage -= 1; loadUsage(); } });
-$("usageNextPage").addEventListener("click", () => { if (state.usagePage < state.usagePages) { state.usagePage += 1; loadUsage(); } });
-$("configUsagePrevPage").addEventListener("click", () => { if (state.configUsagePage > 1) { state.configUsagePage -= 1; loadConfigUsage(); } });
-$("configUsageNextPage").addEventListener("click", () => { if (state.configUsagePage < state.configUsagePages) { state.configUsagePage += 1; loadConfigUsage(); } });
+$("protocol").addEventListener("change", () => { state.page = 1; runAction(loadConnections()); });
+$("status").addEventListener("change", () => { state.page = 1; runAction(loadConnections()); });
+$("search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.page = 1; runAction(loadConnections()); }, 280); });
+$("usageSearch").addEventListener("input", () => { clearTimeout(usageSearchTimer); usageSearchTimer = setTimeout(() => { state.usagePage = 1; runAction(loadUsage()); }, 280); });
+$("configUsageSearch").addEventListener("input", () => { clearTimeout(configUsageSearchTimer); configUsageSearchTimer = setTimeout(() => { state.configUsagePage = 1; runAction(loadConfigUsage()); }, 280); });
+$("prevPage").addEventListener("click", () => { if (state.page > 1) { state.page -= 1; runAction(loadConnections()); } });
+$("nextPage").addEventListener("click", () => { if (state.page < state.pages) { state.page += 1; runAction(loadConnections()); } });
+$("usagePrevPage").addEventListener("click", () => { if (state.usagePage > 1) { state.usagePage -= 1; runAction(loadUsage()); } });
+$("usageNextPage").addEventListener("click", () => { if (state.usagePage < state.usagePages) { state.usagePage += 1; runAction(loadUsage()); } });
+$("configUsagePrevPage").addEventListener("click", () => { if (state.configUsagePage > 1) { state.configUsagePage -= 1; runAction(loadConfigUsage()); } });
+$("configUsageNextPage").addEventListener("click", () => { if (state.configUsagePage < state.configUsagePages) { state.configUsagePage += 1; runAction(loadConfigUsage()); } });
 $("exportCsv").addEventListener("click", () => downloadConnections("csv"));
 $("usageExportCsv").addEventListener("click", () => downloadUsage("csv"));
 $("usageExportJson").addEventListener("click", () => downloadUsage("json"));
 $("configUsageExportCsv").addEventListener("click", () => downloadConfigUsage("csv"));
 $("configUsageExportJson").addEventListener("click", () => downloadConfigUsage("json"));
 $("exportJson").addEventListener("click", () => downloadConnections("json"));
-$("recordsDrawer").addEventListener("toggle", () => { if ($("recordsDrawer").open) loadDetailData().catch((error) => toast(error.message)); });
+$("recordsDrawer").addEventListener("toggle", () => { if ($("recordsDrawer").open) runAction(loadDetailData()); });
 document.querySelectorAll("[data-record-tab]").forEach((button) => button.addEventListener("click", () => {
   document.querySelectorAll("[data-record-tab]").forEach((item) => {
     const selected = item === button;
@@ -669,7 +731,7 @@ $("tokenForm").addEventListener("submit", async (event) => {
     loadDashboard();
     startRefreshTimer();
   } catch (error) {
-    $("tokenError").textContent = error.message;
+    $("tokenError").textContent = failureMessage(error);
   }
 });
 window.addEventListener("resize", () => {
@@ -678,20 +740,24 @@ window.addEventListener("resize", () => {
 });
 
 async function boot() {
+  const now = new Date();
+  const yesterday = new Date(now.getTime() - 86400000);
+  $("rangeStart").value = localInputValue(yesterday);
+  $("rangeEnd").value = localInputValue(now);
+  state.customStart = $("rangeStart").value;
+  state.customEnd = $("rangeEnd").value;
   try {
-    const now = new Date();
-    const yesterday = new Date(now.getTime() - 86400000);
-    $("rangeStart").value = localInputValue(yesterday);
-    $("rangeEnd").value = localInputValue(now);
-    state.customStart = $("rangeStart").value;
-    state.customEnd = $("rangeEnd").value;
     const health = await fetch("/api/health", { cache: "no-store" }).then((response) => response.json());
     if (health.auth_required && !state.token) { showTokenDialog(); return; }
     await loadDashboard();
-    startRefreshTimer();
   } catch (error) {
-    toast("无法连接审计服务");
+    const message = failureMessage(error);
+    setServiceHealth(message);
+    toast(message);
   }
+  // A service that is still restarting when the page loads must recover on its
+  // own instead of staying dead until the next manual reload.
+  startRefreshTimer();
 }
 
 boot();

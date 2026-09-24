@@ -16,11 +16,13 @@ import json
 import os
 import re
 import signal
+import socket
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
+import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -29,7 +31,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 
-SERVICE_VERSION = "1.2.0"
+SERVICE_VERSION = "1.3.0"
 USAGE_BUCKET_SECONDS = 60
 RANGES = {
     "1h": 3600,
@@ -38,6 +40,17 @@ RANGES = {
     "7d": 604800,
     "30d": 2592000,
 }
+# The dashboard reloads every few seconds, so a single slow poll must not mark
+# the collector as broken for a whole minute.  Keep the HTTP timeout above the
+# default interval and cap the retry backoff short enough to recover quickly.
+COLLECTOR_POLL_TIMEOUT = 5
+COLLECTOR_RETRY_MAX = 15
+COLLECTOR_STATUS_GRACE = 15
+# The dashboard issues several parallel requests per refresh, which is well
+# above the standard-library accept queue of 5.
+REQUEST_QUEUE_SIZE = 128
+# Idle keep-alive sockets are dropped after this many seconds.
+CLIENT_IDLE_TIMEOUT = 30
 
 
 def utc_iso(timestamp):
@@ -904,6 +917,7 @@ class Collector:
         self.thread = None
         self.lock = threading.Lock()
         self.last_success = 0
+        self.failures = 0
         self.last_error = "等待首次采集"
 
     def start(self):
@@ -918,9 +932,11 @@ class Collector:
     def status(self):
         with self.lock:
             running = bool(self.thread and self.thread.is_alive() and not self.stop_event.is_set())
+            grace = max(self.interval * 3 + 2, COLLECTOR_STATUS_GRACE)
             return {
                 "running": running,
-                "connected": bool(running and not self.last_error and self.last_success and time.time() - self.last_success <= self.interval * 3 + 2),
+                "connected": bool(running and not self.last_error and self.last_success and time.time() - self.last_success <= grace),
+                "failures": self.failures,
                 "last_success": utc_iso(self.last_success),
                 "last_error": self.last_error,
                 "source": self.url,
@@ -932,7 +948,7 @@ class Collector:
         if self.secret:
             headers["Authorization"] = "Bearer " + self.secret
         request = Request(self.url, headers=headers)
-        with self.opener.open(request, timeout=max(3, self.interval)) as response:
+        with self.opener.open(request, timeout=max(COLLECTOR_POLL_TIMEOUT, self.interval * 3)) as response:
             if response.status != 200:
                 raise RuntimeError("sing-box API 返回 HTTP {}".format(response.status))
             snapshot = json.loads(response.read().decode("utf-8"))
@@ -942,6 +958,7 @@ class Collector:
         with self.lock:
             self.last_success = int(time.time())
             self.last_error = ""
+            self.failures = 0
 
     def _run(self):
         failures = 0
@@ -950,11 +967,19 @@ class Collector:
             try:
                 self._poll()
                 failures = 0
+                with self.lock:
+                    self.failures = 0
             except (HTTPError, URLError, OSError, ValueError, RuntimeError, sqlite3.Error) as error:
                 failures += 1
                 with self.lock:
+                    self.failures = failures
                     self.last_error = str(error)
-            retry_interval = min(60, max(self.interval, 2 ** min(failures, 6))) if failures else self.interval
+            if failures:
+                # Cap the backoff so a transient blip stays visible for seconds
+                # instead of leaving the dashboard red for up to a minute.
+                retry_interval = max(self.interval, min(COLLECTOR_RETRY_MAX, 2 ** min(failures, 6)))
+            else:
+                retry_interval = self.interval
             wait_for = max(0.2, retry_interval - (time.monotonic() - started))
             self.stop_event.wait(wait_for)
 
@@ -962,17 +987,55 @@ class Collector:
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = REQUEST_QUEUE_SIZE
 
 
 class AuditHandler(BaseHTTPRequestHandler):
     server_version = "sing-box-audit/" + SERVICE_VERSION
+    # Keep the dashboard's frequent polling on reused sockets instead of opening
+    # a fresh TCP connection for every request.  Every response sets
+    # Content-Length, which HTTP/1.1 keep-alive requires.
+    protocol_version = "HTTP/1.1"
+    timeout = CLIENT_IDLE_TIMEOUT
 
     def log_message(self, message, *args):
         # The dashboard refreshes frequently; successful access logs would only
         # flood journald/OpenRC logs. Exceptions are still reported by the server.
         return
 
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (socket.timeout, TimeoutError, ConnectionResetError, BrokenPipeError):
+            # An idle keep-alive socket or a client that vanished between
+            # requests is expected; do not log a traceback for it.
+            self.close_connection = True
+
+    def _internal_error(self, error):
+        sys.stderr.write("请求处理失败: {}: {}\n".format(type(error).__name__, error))
+        traceback.print_exc()
+        if getattr(self, "response_started", False):
+            # Headers are already on the wire, so the response cannot be replaced.
+            self.close_connection = True
+            return
+        try:
+            self._json({"error": "internal_error", "message": "审计服务内部错误"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        except OSError:
+            self.close_connection = True
+
+    def _run_request(self, handler):
+        # Without this guard an unexpected failure closes the socket without a
+        # response, which browsers surface as an opaque "Failed to fetch".
+        self.response_started = False
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as error:
+            self._internal_error(error)
+
     def end_headers(self):
+        self.response_started = True
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -1011,6 +1074,9 @@ class AuditHandler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self):
+        self._run_request(self._do_get)
+
+    def _do_get(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
             collector = self.server.collector.status()
@@ -1018,6 +1084,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 "ok": True, "service": "sing-box-audit", "version": SERVICE_VERSION,
                 "auth_required": bool(self.server.web_token),
                 "collector_running": collector["running"], "collector_connected": collector["connected"],
+                "collector_failures": collector["failures"],
             })
             return
         if parsed.path.startswith("/api/"):
@@ -1051,6 +1118,9 @@ class AuditHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        self._run_request(self._do_post)
+
+    def _do_post(self):
         parsed = urlparse(self.path)
         if parsed.path != "/api/auth":
             self.send_error(HTTPStatus.NOT_FOUND)

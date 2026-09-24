@@ -318,9 +318,9 @@ audit_status() {
     else
         service_status=$(_red_bg stopped)
     fi
-    health=$(_wget -qO- -T 2 "http://$health_host:$port/api/health" 2>/dev/null)
+    health=$(_wget -qO- -T 5 "http://$health_host:$port/api/health" 2>/dev/null)
     token=$(audit_config_get '.web_token')
-    summary=$(_wget -qO- -T 2 --header="Authorization: Bearer $token" "http://$health_host:$port/api/summary?range=24h" 2>/dev/null)
+    summary=$(_wget -qO- -T 5 --header="Authorization: Bearer $token" "http://$health_host:$port/api/summary?range=24h" 2>/dev/null)
     msg "\n流量审计: $service_status"
     msg "监听地址: $listen:$port"
     msg "数据保留: $(audit_config_get '.retention_days') 天"

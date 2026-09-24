@@ -1,4 +1,5 @@
 import importlib.util
+import http.client
 import io
 import json
 import os
@@ -297,6 +298,30 @@ class CollectorTests(unittest.TestCase):
         collector.last_error = "synthetic failure"
         self.assertFalse(collector.status()["connected"])
 
+    def test_status_tolerates_a_slow_poll_and_reports_failure_count(self):
+        collector = audit.Collector(None, "http://127.0.0.1:1", "", 1)
+        collector.thread = mock.Mock()
+        collector.thread.is_alive.return_value = True
+        collector.last_error = ""
+        # A capture that takes ten seconds must not be reported as broken before
+        # the grace period is over.
+        collector.last_success = time.time() - 10
+        status = collector.status()
+        self.assertTrue(status["connected"])
+        self.assertEqual(status["failures"], 0)
+
+    def test_retry_backoff_is_capped(self):
+        collector = audit.Collector(None, "http://127.0.0.1:1", "", 1)
+        collector.stop_event = mock.Mock()
+        collector.stop_event.is_set.side_effect = [False] * 8 + [True]
+        with mock.patch.object(collector, "_poll", side_effect=sqlite3.OperationalError("synthetic failure")):
+            with mock.patch.object(audit.time, "monotonic", return_value=0):
+                collector._run()
+        waits = [call.args[0] for call in collector.stop_event.wait.call_args_list]
+        self.assertEqual(waits, [2, 4, 8, audit.COLLECTOR_RETRY_MAX, audit.COLLECTOR_RETRY_MAX,
+                                 audit.COLLECTOR_RETRY_MAX, audit.COLLECTOR_RETRY_MAX, audit.COLLECTOR_RETRY_MAX])
+        self.assertEqual(collector.status()["failures"], 8)
+
 
 class FakeClashHandler(BaseHTTPRequestHandler):
     snapshot = {"uploadTotal": 100, "downloadTotal": 200, "connections": [connection()]}
@@ -361,6 +386,7 @@ class HttpIntegrationTests(unittest.TestCase):
             self.assertTrue(health["ok"])
             self.assertTrue(health["collector_running"])
             self.assertTrue(health["collector_connected"])
+            self.assertEqual(health["collector_failures"], 0)
         with self.assertRaises(HTTPError) as denied:
             self.request("/api/summary")
         self.assertEqual(denied.exception.code, 401)
@@ -389,6 +415,32 @@ class HttpIntegrationTests(unittest.TestCase):
             self.assertIn("配置文件流量", page)
             self.assertIn("访问热力", page)
             self.assertIn("流量路径", page)
+
+    def test_keep_alive_serves_several_requests_on_one_connection(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        try:
+            for _ in range(3):
+                connection.request("GET", "/api/health")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertFalse(response.will_close)
+                json.load(response)
+        finally:
+            connection.close()
+
+    def test_internal_failure_returns_a_json_error_instead_of_dropping_the_request(self):
+        log = io.StringIO()
+        with mock.patch.object(audit.sys, "stderr", log):
+            with mock.patch.object(audit.AuditStore, "summary", side_effect=RuntimeError("synthetic failure")):
+                with self.assertRaises(HTTPError) as failure:
+                    self.request("/api/summary?range=24h", "test-web-token-123456")
+        self.assertEqual(failure.exception.code, 500)
+        payload = json.loads(failure.exception.read().decode("utf-8"))
+        self.assertEqual(payload["error"], "internal_error")
+        failure.exception.close()
+        # The traceback must reach the service log, otherwise the dashboard error
+        # cannot be diagnosed.
+        self.assertIn("synthetic failure", log.getvalue())
 
     def test_usage_api_custom_range_and_export(self):
         self.server.collector.stop()
