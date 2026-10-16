@@ -1,2 +1,5 @@
 __pycache__/
 *.py[cod]
+
+# 本地助手会话记录, 不属于仓库内容
+.workbuddy-ai/
