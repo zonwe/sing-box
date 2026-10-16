@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 
-SERVICE_VERSION = "1.3.3"
+SERVICE_VERSION = "1.3.4"
 USAGE_BUCKET_SECONDS = 60
 # destination_samples only ever feeds the "top destinations" ranking, which
 # aggregates the whole window and never shows a timestamp, so it does not need
@@ -1452,7 +1452,10 @@ class AuditHandler(BaseHTTPRequestHandler):
     def _authorized(self):
         expected = self.server.web_token
         if not expected:
-            return True
+            # A missing token must never turn into anonymous access to the audit
+            # database (source IPs, UUID users, visited hosts).  build_server()
+            # refuses such a config, so this is the second line of defence.
+            return False
         supplied = self.headers.get("Authorization", "")
         if supplied.startswith("Bearer "):
             supplied = supplied[7:]
@@ -1637,6 +1640,12 @@ def build_server(config):
     web_root = config.get("web_root") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
     if not os.path.isfile(os.path.join(web_root, "index.html")):
         raise ValueError("找不到前端资源: " + web_root)
+    # load_config() already refuses a short token, but this is the value the HTTP
+    # handler compares against, so refuse an empty one here as well instead of
+    # falling back to "authentication disabled".
+    web_token = str(config.get("web_token") or "")
+    if not web_token:
+        raise ValueError("web_token 不能为空")
     store = AuditStore(config["database"], config.get("retention_days", 90))
     resolver = ConfigIdentityResolver(config.get("config_dir", ""))
     collector = Collector(
@@ -1647,7 +1656,7 @@ def build_server(config):
     server.store = store
     server.collector = collector
     server.web_root = web_root
-    server.web_token = str(config.get("web_token") or "")
+    server.web_token = web_token
     return server
 
 

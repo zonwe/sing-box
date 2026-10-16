@@ -549,6 +549,33 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(collector.status()["failures"], 8)
 
 
+class ServerConfigTests(unittest.TestCase):
+    @staticmethod
+    def config(token):
+        return {
+            "listen": "127.0.0.1",
+            "port": 0,
+            "database": ":memory:",
+            "collector_url": "http://127.0.0.1:1",
+            "web_token": token,
+            "web_root": str(ROOT / "src" / "audit" / "web"),
+        }
+
+    def test_build_server_refuses_an_empty_web_token(self):
+        # AuditHandler treats an empty token as "authentication disabled", so a
+        # server built without one would answer every request anonymously.
+        with self.assertRaisesRegex(ValueError, "web_token"):
+            audit.build_server(self.config(""))
+
+    def test_handler_denies_anonymous_requests_without_a_token(self):
+        # Second line of defence: a running server whose token is empty must
+        # still refuse anonymous requests instead of serving the audit data.
+        handler = audit.AuditHandler.__new__(audit.AuditHandler)
+        handler.server = type("Server", (), {"web_token": ""})()
+        handler.headers = {}
+        self.assertFalse(handler._authorized())
+
+
 class FakeClashHandler(BaseHTTPRequestHandler):
     snapshot = {"uploadTotal": 100, "downloadTotal": 200, "connections": [connection()]}
 
