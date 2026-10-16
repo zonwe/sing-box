@@ -24,6 +24,7 @@ show_help() {
             "   url [name]                                      URL 信息"
             "   log                                             查看日志"
             "   audit [...]                                     流量审计、Web 展示与数据导出"
+            "   acl [...]                                       来源 IP 白名单 (只允许指定 IP 使用代理)\n"
             # "   logerr                                          查看错误日志\n"
             "更改:"
             # "   dp, dynamicport [name] [start | auto] [end]     更改动态端口"

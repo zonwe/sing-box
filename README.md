@@ -23,6 +23,7 @@
 - 一键添加 VLESS-(WS/H2/HTTPUpgrade)-TLS
 - 一键添加 Trojan-(WS/H2/HTTPUpgrade)-TLS
 - 一键启用 BBR
+- 一键启用来源 IP 白名单，只允许指定 IP 使用代理
 - 默认启用流量审计服务与 Web 仪表盘
 - 按配置文件统计指定时间段的流量、来源 IP、用户和连接数
 - 按来源 IP、配置文件和 UUID/用户统计明细流量
@@ -106,6 +107,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/zonwe/sing-box/main/install.s
 测试只使用临时目录、模拟服务和回环 HTTP 接口。
 
 - 流量审计：[部署与使用文档](docs/traffic-audit.md)
+- 来源 IP 白名单：[部署与使用文档](docs/ip-allowlist.md)
 - 原脚本安装及使用：https://233boy.com/sing-box/sing-box-script/
 
 # 帮助
@@ -132,6 +134,7 @@ Usage: sing-box [options]... [args]...
    url [name]                                      URL 信息
    log                                             查看日志
    audit [...]                                     流量审计、Web 展示与数据导出
+   acl [...]                                       来源 IP 白名单 (只允许指定 IP 使用代理)
 更改:
    full [name] [...]                               更改多个参数
    id [name] [uuid | auto]                         更改 UUID
@@ -238,3 +241,41 @@ ssh -L 9091:127.0.0.1:9091 root@服务器IP
 如确需监听所有网卡，可使用 `sing-box audit enable 0.0.0.0 9091`，但应在防火墙或
 反向代理处限制来源并配置 TLS。审计记录包含来源 IP、目标地址和用户标识，请依据当地
 法规设置保留期限并控制访问权限。
+
+# 来源 IP 白名单
+
+完整说明请参阅：[来源 IP 白名单部署与使用](docs/ip-allowlist.md)。
+
+`sing-box acl` 只允许指定 IP/CIDR 使用代理服务，规则由系统防火墙在内核层生效，
+未认证的扫描流量不会进入 sing-box 进程。默认使用独立的 nftables 表
+（`inet nftables_singbox_acl`），没有 nft 时回退到独立 iptables 链 `SB_ACL`；
+两种方式都不会改动用户既有规则，也不会执行 `flush ruleset`。
+
+```bash
+# 添加允许的来源，支持 IPv4/IPv6 与 CIDR
+sing-box acl add 203.0.113.7
+sing-box acl add 198.51.100.0/24
+
+# 查看将要保护哪些端口（含 Caddy HTTPS 端口）
+sing-box acl status
+
+# 启用；5 分钟内未确认会自动回滚，避免把自己锁在外面
+sing-box acl on
+sing-box acl confirm
+```
+
+保护端口按 `conf/*.json` 逐个入站解析：监听在 `::` 的入站按其端口保护，监听在
+`127.0.0.1` 的入站会被跳过（只接受 Caddy 连接，不适合套来源限制），存在 Caddy 站点
+时额外保护 `https_port`。TCP 与 UDP 同时覆盖，保证 Hysteria2、TUIC、QUIC 可用。
+
+需要注意的边界：
+
+- Caddy 的 `http_port`（默认 80）始终保持开放，否则 ACME 的 HTTP-01 校验会失败；
+  Let's Encrypt 不公布校验节点 IP，因此 80/443 无法在不影响证书签发的前提下做来源限制。
+- 防火墙按端口生效，同一端口上的多个配置共享白名单，无法按域名区分。
+- 域名走 Cloudflare 等 CDN 时，服务端看到的来源是 CDN 节点，按真实客户端 IP 配置不会命中。
+- 检测到 firewalld / ufw 正在管理防火墙时脚本会拒绝写入（除非显式 `--yes`），
+  避免第三方规则被其重载清除。
+
+新增、删除配置或 `fix-all` 之后会自动按新的端口集合重新应用规则，也可以手工执行
+`sing-box acl sync`。卸载脚本时会先移除规则和开机服务，再删除配置目录。

@@ -405,6 +405,7 @@ create() {
         }
         # restart core
         manage restart &
+        acl_sync
         ;;
     client)
         is_tls=tls
@@ -738,6 +739,8 @@ del() {
     fi
     unset is_dont_get_ip
     [[ $is_dont_auto_exit ]] && unset is_config_file
+    # 端口集合发生变化, 同步防火墙白名单
+    [[ ! $is_conf_dir_empty ]] && acl_sync
 }
 
 # uninstall
@@ -753,6 +756,11 @@ uninstall() {
     [[ -f $is_audit_config ]] && {
         load audit.sh
         audit_uninstall -y parent
+    }
+    # 先移除防火墙白名单规则和开机单元, 再删除配置目录
+    [[ -d $acl_state_dir ]] && {
+        load_acl
+        acl_uninstall parent
     }
     rm -rf $is_core_dir $is_log_dir $is_sh_bin ${is_sh_bin/$is_core/sb}
     if [[ $is_systemd ]]; then
@@ -1657,6 +1665,27 @@ update() {
     msg "$(_green 请查看更新说明: https://github.com/$is_update_repo/releases/tag/$is_new_ver)\n"
 }
 
+# 需要 acl 模块时加载, 并保证 sync 钩子可用
+load_acl() {
+    [[ $is_acl_loaded ]] && return
+    is_acl_loaded=1
+    load acl.sh
+}
+
+acl() {
+    load_acl
+    _acl_main "$@"
+}
+
+# 白名单生效后新增/删除配置会改变保护端口, 需要同步防火墙
+acl_sync() {
+    [[ $is_acl_loaded ]] || return 0
+    # 批量删除/修复时只同步一次
+    [[ $is_acl_sync_pending ]] && return 0
+    is_acl_sync_pending=1
+    acl_sync_bg
+}
+
 # main menu; if no prefer args.
 is_main_menu() {
     msg "\n------------- $is_core_name script $is_sh_ver by $author -------------"
@@ -1697,7 +1726,7 @@ is_main_menu() {
         show_help
         ;;
     9)
-        ask list is_do_other "启用BBR 查看日志 测试运行 重装脚本 设置DNS 流量审计"
+        ask list is_do_other "启用BBR 查看日志 测试运行 重装脚本 设置DNS 流量审计 IP白名单"
         case $REPLY in
         1)
             load bbr.sh
@@ -1720,6 +1749,9 @@ is_main_menu() {
         6)
             load audit.sh
             audit_main
+            ;;
+        7)
+            acl status
             ;;
         esac
         ;;
@@ -1785,6 +1817,8 @@ main() {
                 return 1
             fi
             _green "\nfix 完成.\n"
+            manage restart &
+            acl_sync
             ;;
         *)
             is_dont_auto_exit=1
@@ -1840,6 +1874,9 @@ main() {
     audit)
         load audit.sh
         audit_main "${@:2}"
+        ;;
+    acl)
+        acl "${@:2}"
         ;;
     url | qr)
         url_qr $@
