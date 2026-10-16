@@ -570,6 +570,9 @@ class FakeClashHandler(BaseHTTPRequestHandler):
 class HttpIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        # Every test starts from the same synthetic snapshot, so the deltas the
+        # usage reports are built from stay predictable.
+        FakeClashHandler.snapshot = {"uploadTotal": 100, "downloadTotal": 200, "connections": [connection()]}
         self.clash = HTTPServer(("127.0.0.1", 0), FakeClashHandler)
         self.clash_thread = threading.Thread(target=self.clash.serve_forever, daemon=True)
         self.clash_thread.start()
@@ -621,9 +624,22 @@ class HttpIntegrationTests(unittest.TestCase):
             payload = json.load(response)
             self.assertEqual(payload["active_connections"], 1)
             self.assertTrue(payload["collector"]["connected"])
-        with self.request("/api/traffic-flow?range=24h", "test-web-token-123456") as response:
-            payload = json.load(response)
-            self.assertEqual(payload["items"][0]["target"], "example.com")
+        # The flow chart is built from per-poll deltas, so move the counters once
+        # and wait for the next poll to record a path.
+        FakeClashHandler.snapshot = {
+            "uploadTotal": 300,
+            "downloadTotal": 600,
+            "connections": [connection(upload=90, download=180)],
+        }
+        deadline = time.time() + 5
+        payload = {"items": []}
+        while time.time() < deadline and not payload["items"]:
+            with self.request("/api/traffic-flow?range=24h", "test-web-token-123456") as response:
+                payload = json.load(response)
+            if not payload["items"]:
+                time.sleep(0.1)
+        self.assertEqual(payload["items"][0]["target"], "example.com")
+        self.assertEqual(payload["scope"], "paths_sampled_in_window")
         with self.request("/api/activity?range=24h&timezone_offset=-480", "test-web-token-123456") as response:
             payload = json.load(response)
             self.assertEqual(payload["timezone_offset"], -480)
@@ -667,6 +683,11 @@ class HttpIntegrationTests(unittest.TestCase):
             with mock.patch.object(audit.sys, "stderr", log):
                 with self.request("/api/summary?range=24h", "test-web-token-123456") as response:
                     response.read()
+                # The client can read the body before the server thread reaches
+                # its finally block, so wait while the patch is still in place.
+                deadline = time.time() + 2
+                while time.time() < deadline and "/api/summary?range=24h" not in log.getvalue():
+                    time.sleep(0.05)
         self.assertIn("/api/summary?range=24h", log.getvalue())
 
     def test_internal_failure_returns_a_json_error_instead_of_dropping_the_request(self):

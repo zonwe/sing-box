@@ -7,6 +7,7 @@ dashboard/API.  It intentionally uses only the Python standard library.
 """
 
 import argparse
+import contextlib
 import csv
 import datetime
 import glob
@@ -31,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 
-SERVICE_VERSION = "1.3.2"
+SERVICE_VERSION = "1.3.3"
 USAGE_BUCKET_SECONDS = 60
 # destination_samples only ever feeds the "top destinations" ranking, which
 # aggregates the whole window and never shows a timestamp, so it does not need
@@ -40,6 +41,11 @@ USAGE_BUCKET_SECONDS = 60
 # config usage keep the one minute bucket because those views do show first_seen
 # and last_seen and support custom windows.
 DESTINATION_BUCKET_SECONDS = 300
+# flow_samples backs the traffic path chart and follows the same reasoning: the
+# chart picks the busiest paths of a whole window, so five minute buckets hold
+# every number it shows while keeping the table - and the scan behind each
+# dashboard refresh - far smaller than the connection rows it replaces.
+FLOW_BUCKET_SECONDS = 300
 RANGES = {
     "1h": 3600,
     "6h": 21600,
@@ -72,6 +78,21 @@ SQLITE_MMAP_BYTES = 256 * 1024 * 1024
 # Used only where a memory map is unavailable (32-bit builds, some container
 # filesystems), so the same hot window still fits in an explicit page cache.
 SQLITE_FALLBACK_CACHE_KIB = 32 * 1024
+# A dashboard refresh fires several aggregate queries at once and every one of
+# them needs the same store lock.  Once the database no longer fits in the page
+# cache those queries take seconds, so requests pile up in front of the
+# collector and the backlog never drains: the browser abandons a request after
+# twelve seconds, but the server thread keeps its place in the queue, and the
+# queue keeps growing until the whole service thrashes.  A read therefore takes
+# one of a small number of slots and waits a bounded time for the lock; work
+# that cannot start is refused with a busy error instead of queueing forever.
+STORE_READ_SLOTS = 6
+STORE_READ_SLOT_WAIT = 2.0
+STORE_READ_LOCK_WAIT = 3.0
+# Shutdown waits this long for the store lock.  A queued read must never keep
+# the service from stopping, or systemd has to SIGKILL it after TimeoutStopSec
+# and a restart looks stuck for a minute and a half.
+STORE_CLOSE_LOCK_WAIT = 5.0
 
 
 def utc_iso(timestamp):
@@ -205,6 +226,10 @@ class ConfigIdentityResolver:
         return entry["config_name"], user
 
 
+class StoreBusy(RuntimeError):
+    """Raised when the store is already loaded and will not accept more work."""
+
+
 class AuditStore:
     CONNECTION_COLUMNS = (
         "id", "start_time", "end_time", "last_seen", "status", "network",
@@ -273,6 +298,19 @@ class AuditStore:
         "INSERT OR IGNORE INTO destination_samples (ts, destination, upload, download) "
         "VALUES (?, ?, ?, ?)"
     )
+    FLOW_UPSERT_SQL = (
+        "INSERT INTO flow_samples (ts, source_ip, config_name, route, target, upload, download) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ts, source_ip, config_name, route, target) DO UPDATE SET "
+        "upload = upload + excluded.upload, download = download + excluded.download"
+    )
+    FLOW_ADD_SQL = (
+        "UPDATE flow_samples SET upload = upload + ?, download = download + ? "
+        "WHERE ts = ? AND source_ip = ? AND config_name = ? AND route = ? AND target = ?"
+    )
+    FLOW_INSERT_SQL = (
+        "INSERT OR IGNORE INTO flow_samples (ts, source_ip, config_name, route, target, upload, download) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
     CLOSE_CONNECTION_SQL = "UPDATE connections SET status = 'closed', end_time = ? WHERE id = ?"
     STATE_WRITE_SQL = "INSERT OR REPLACE INTO state(key, value) VALUES (?, ?)"
     USAGE_EXPORT_COLUMNS = (
@@ -290,6 +328,8 @@ class AuditStore:
         self.database = database
         self.retention_days = clamp(as_int(retention_days, 90), 1, 3650)
         self.lock = threading.RLock()
+        # Readers take a slot before they queue for the lock; see _read().
+        self.read_slots = threading.BoundedSemaphore(STORE_READ_SLOTS)
         # UPSERT syntax arrived in SQLite 3.24 (2018).  Distributions that still
         # ship an older SQLite - CentOS 7, Debian 9, Ubuntu 18.04 - fall back to
         # an add-then-fill pair that writes the same rows.
@@ -300,6 +340,8 @@ class AuditStore:
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self._open_read_cache()
+        # Per-thread read-only connections; see _reader().
+        self.local = threading.local()
         # Last metadata written for each live connection; see capture().
         self.connection_meta = {}
         self._migrate()
@@ -308,14 +350,44 @@ class AuditStore:
         except OSError:
             pass
 
-    def _open_read_cache(self):
+    def _open_read_cache(self, connection=None):
+        connection = connection or self.db
         try:
-            row = self.db.execute("PRAGMA mmap_size={}".format(SQLITE_MMAP_BYTES)).fetchone()
+            row = connection.execute("PRAGMA mmap_size={}".format(SQLITE_MMAP_BYTES)).fetchone()
             mapped = row[0] if row else 0
         except sqlite3.Error:
             mapped = 0
         if not mapped:
-            self.db.execute("PRAGMA cache_size=-{}".format(SQLITE_FALLBACK_CACHE_KIB))
+            connection.execute("PRAGMA cache_size=-{}".format(SQLITE_FALLBACK_CACHE_KIB))
+
+    def _reader(self):
+        """Return this thread's read-only connection, opening it on first use.
+
+        WAL mode lets many readers run beside the single writer, so dashboard
+        queries no longer queue behind each other and the collector never waits
+        for one of them.  Each request thread owns its connection and closes it
+        through release_reader() when the request is done.
+        """
+        connection = getattr(self.local, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(self.database)
+            connection.row_factory = sqlite3.Row
+            # query_only is a safety net: reads must never write through here.
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA busy_timeout=5000")
+            self._open_read_cache(connection)
+            self.local.connection = connection
+        return connection
+
+    def release_reader(self):
+        connection = getattr(self.local, "connection", None)
+        if connection is None:
+            return
+        self.local.connection = None
+        try:
+            connection.close()
+        except sqlite3.Error:
+            pass
 
     def _migrate(self):
         with self.lock, self.db:
@@ -367,6 +439,16 @@ class AuditStore:
                     download INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (ts, destination)
                 );
+                CREATE TABLE IF NOT EXISTS flow_samples (
+                    ts INTEGER NOT NULL,
+                    source_ip TEXT NOT NULL DEFAULT '',
+                    config_name TEXT NOT NULL DEFAULT '',
+                    route TEXT NOT NULL DEFAULT '',
+                    target TEXT NOT NULL DEFAULT '',
+                    upload INTEGER NOT NULL DEFAULT 0,
+                    download INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (ts, source_ip, config_name, route, target)
+                );
                 CREATE TABLE IF NOT EXISTS state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -390,8 +472,34 @@ class AuditStore:
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_connections_config_name ON connections(config_name)")
 
     def close(self):
-        with self.lock:
+        # Never wait for a queued read to finish: the service has to stop
+        # promptly even when the dashboard left work behind, otherwise systemd
+        # escalates to SIGKILL after TimeoutStopSec.  Skipping the close is
+        # safe - SQLite recovers from an open database through the WAL.
+        self.release_reader()
+        if not self.lock.acquire(timeout=STORE_CLOSE_LOCK_WAIT):
+            sys.stderr.write("关闭数据库超时, 跳过 (下次启动由 WAL 恢复)\n")
+            return
+        try:
             self.db.close()
+        finally:
+            self.lock.release()
+
+    @contextlib.contextmanager
+    def _read(self):
+        """Admission control for a dashboard read.
+
+        Readers use their own connection (see _reader), so they no longer wait
+        for the collector's lock; the slot only keeps a burst of parallel scans
+        from thrashing a slow disk.  Work that cannot get a slot is refused
+        instead of queueing, so a busy dashboard cannot bury the service.
+        """
+        if not self.read_slots.acquire(timeout=STORE_READ_SLOT_WAIT):
+            raise StoreBusy("审计服务繁忙, 请稍后重试")
+        try:
+            yield
+        finally:
+            self.read_slots.release()
 
     def _state_get(self, key):
         row = self.db.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
@@ -464,6 +572,7 @@ class AuditStore:
         active_ids = set()
         usage_deltas = {}
         destination_deltas = {}
+        flow_deltas = {}
         connection_updates = []
         connection_hot_updates = []
         connection_inserts = []
@@ -550,6 +659,14 @@ class AuditStore:
                         destination_deltas[record["destination"]] = (
                             old_destination[0] + connection_upload, old_destination[1] + connection_download,
                         )
+                    # The path chart reads this rollup instead of grouping the
+                    # connection rows of the whole window on every refresh.
+                    flow_key = (
+                        record["source_ip"], record["config_name"], record["outbound"],
+                        record["host"] or record["destination"],
+                    )
+                    old_flow = flow_deltas.get(flow_key, (0, 0))
+                    flow_deltas[flow_key] = (old_flow[0] + connection_upload, old_flow[1] + connection_download)
 
             if connection_hot_updates:
                 self.db.executemany(self.CONNECTION_HOT_UPDATE_SQL, connection_hot_updates)
@@ -586,6 +703,20 @@ class AuditStore:
                         for ts, destination, sample_upload, sample_download in destination_rows
                     ])
                     self.db.executemany(self.DESTINATION_INSERT_SQL, destination_rows)
+            if flow_deltas:
+                flow_ts = (now // FLOW_BUCKET_SECONDS) * FLOW_BUCKET_SECONDS
+                flow_rows = [
+                    (flow_ts, source_ip, config_name, route, target, sample_upload, sample_download)
+                    for (source_ip, config_name, route, target), (sample_upload, sample_download) in flow_deltas.items()
+                ]
+                if self.supports_upsert:
+                    self.db.executemany(self.FLOW_UPSERT_SQL, flow_rows)
+                else:
+                    self.db.executemany(self.FLOW_ADD_SQL, [
+                        (sample_upload, sample_download, ts, source_ip, config_name, route, target)
+                        for ts, source_ip, config_name, route, target, sample_upload, sample_download in flow_rows
+                    ])
+                    self.db.executemany(self.FLOW_INSERT_SQL, flow_rows)
 
             stale = [(now, connection_id) for connection_id in known if connection_id not in active_ids]
             if stale:
@@ -608,9 +739,10 @@ class AuditStore:
         ).rowcount
         usage_samples = self.db.execute("DELETE FROM usage_samples WHERE ts < ?", (cutoff,)).rowcount
         destination_samples = self.db.execute("DELETE FROM destination_samples WHERE ts < ?", (cutoff,)).rowcount
+        flow_samples = self.db.execute("DELETE FROM flow_samples WHERE ts < ?", (cutoff,)).rowcount
         return {
             "samples": samples, "usage_samples": usage_samples, "destination_samples": destination_samples,
-            "connections": connections, "cutoff": cutoff,
+            "flow_samples": flow_samples, "connections": connections, "cutoff": cutoff,
         }
 
     def purge(self, days):
@@ -652,20 +784,29 @@ class AuditStore:
         )
 
     def summary(self, range_name, start=None, end=None):
+        rdb = self._reader()
         now = time.time()
         since, until = self.time_window(range_name, start, end)
-        with self.lock:
-            totals = self.db.execute(
+        with self._read():
+            totals = rdb.execute(
                 "SELECT COALESCE(SUM(upload), 0) AS upload, COALESCE(SUM(download), 0) AS download "
                 "FROM traffic_samples WHERE ts BETWEEN ? AND ?",
                 (since, until),
             ).fetchone()
-            sample_time = float(self._state_get("collector_sample_time") or 0)
-            sample_seconds = float(self._state_get("collector_sample_seconds") or 0)
+            state = {
+                row["key"]: row["value"]
+                for row in rdb.execute(
+                    "SELECT key, value FROM state WHERE key IN "
+                    "('collector_sample_time', 'collector_sample_seconds', "
+                    "'collector_upload_speed', 'collector_download_speed')"
+                ).fetchall()
+            }
+            sample_time = float(state.get("collector_sample_time") or 0)
+            sample_seconds = float(state.get("collector_sample_seconds") or 0)
             fresh = 0 <= now - sample_time <= max(10, min(sample_seconds, 60) * 3 + 2)
-            upload_speed = as_int(self._state_get("collector_upload_speed")) if fresh else 0
-            download_speed = as_int(self._state_get("collector_download_speed")) if fresh else 0
-            counts = self.db.execute(
+            upload_speed = as_int(state.get("collector_upload_speed")) if fresh else 0
+            download_speed = as_int(state.get("collector_download_speed")) if fresh else 0
+            counts = rdb.execute(
                 "SELECT COUNT(*) AS total, "
                 "SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active, "
                 "COUNT(DISTINCT NULLIF(source_ip, '')) AS clients, "
@@ -690,6 +831,7 @@ class AuditStore:
         }
 
     def timeseries(self, range_name, bucket=None, start=None, end=None):
+        rdb = self._reader()
         since, until = self.time_window(range_name, start, end)
         default_buckets = {"1h": 60, "6h": 300, "24h": 900, "7d": 3600, "30d": 21600, "all": 86400}
         if start or end:
@@ -698,8 +840,8 @@ class AuditStore:
         else:
             default_bucket = default_buckets.get(range_name, 900)
         bucket = clamp(as_int(bucket, default_bucket), 10, 604800)
-        with self.lock:
-            rows = self.db.execute(
+        with self._read():
+            rows = rdb.execute(
                 "SELECT (ts / ?) * ? AS bucket, SUM(upload) AS upload, SUM(download) AS download "
                 "FROM traffic_samples WHERE ts BETWEEN ? AND ? GROUP BY bucket ORDER BY bucket",
                 (bucket, bucket, since, until),
@@ -714,17 +856,18 @@ class AuditStore:
 
     def activity(self, range_name, timezone_offset=0, start=None, end=None):
         """Aggregate traffic by local weekday and hour for a compact heatmap."""
+        rdb = self._reader()
         since, until = self.time_window(range_name, start, end)
         # JavaScript getTimezoneOffset is UTC minus local time, so invert it
         # before shifting Unix timestamps into the viewer's local day.
         shift_seconds = -clamp(as_int(timezone_offset, 0), -840, 840) * 60
-        with self.lock:
+        with self._read():
             # Plain integer division instead of strftime: weekday and hour are
             # just quotients of the shifted timestamp, and this runs over every
             # sample in the window (a 7d range is over 600k rows).
             # 1970-01-01 was a Thursday, and %w counts Sunday as 0, so the
             # day-of-week needs a +4 rotation.
-            rows = self.db.execute(
+            rows = rdb.execute(
                 "SELECT ((ts + ?) / 86400 + 4) % 7 AS weekday, "
                 "((ts + ?) / 3600) % 24 AS hour, "
                 "SUM(upload) AS upload, SUM(download) AS download "
@@ -744,14 +887,15 @@ class AuditStore:
         }
 
     def top_destinations(self, range_name, limit=8, start=None, end=None):
+        rdb = self._reader()
         since, until = self.time_window(range_name, start, end)
         # Snap to the bucket destination_samples is stored in, so the boundary
         # buckets are counted whole rather than partially.
         since = (since // DESTINATION_BUCKET_SECONDS) * DESTINATION_BUCKET_SECONDS
         until = (until // DESTINATION_BUCKET_SECONDS) * DESTINATION_BUCKET_SECONDS
         limit = clamp(as_int(limit, 8), 1, 50)
-        with self.lock:
-            rows = self.db.execute(
+        with self._read():
+            rows = rdb.execute(
                 "SELECT destination AS name, SUM(upload) AS upload, SUM(download) AS download, 0 AS connections "
                 "FROM destination_samples WHERE ts BETWEEN ? AND ? GROUP BY destination HAVING destination != '' "
                 "ORDER BY (SUM(upload) + SUM(download)) DESC LIMIT ?",
@@ -760,35 +904,44 @@ class AuditStore:
         return [dict(row) for row in rows]
 
     def traffic_flow(self, range_name, limit=12, start=None, end=None):
-        """Aggregate the busiest connection paths that overlap a time window."""
+        """Aggregate the busiest connection paths seen inside a time window.
+
+        Reads the five minute rollup the collector writes, so the chart costs a
+        scan of sampled paths instead of a GROUP BY over every connection row of
+        the window.  Long connections therefore contribute the bytes observed in
+        the window rather than their whole lifetime total.
+        """
+        rdb = self._reader()
         since, until = self.time_window(range_name, start, end)
+        since = (since // FLOW_BUCKET_SECONDS) * FLOW_BUCKET_SECONDS
+        until = (until // FLOW_BUCKET_SECONDS) * FLOW_BUCKET_SECONDS
         limit = clamp(as_int(limit, 12), 1, 30)
-        with self.lock:
-            rows = self.db.execute(
+        with self._read():
+            rows = rdb.execute(
                 "SELECT "
                 "COALESCE(NULLIF(source_ip, ''), '未知来源') AS source, "
-                "COALESCE(NULLIF(config_name, ''), NULLIF(inbound, ''), '未识别') AS config, "
-                "COALESCE(NULLIF(outbound, ''), '其他路由') AS route, "
-                "COALESCE(NULLIF(host, ''), NULLIF(destination, ''), NULLIF(destination_ip, ''), '未知目标') AS target, "
+                "COALESCE(NULLIF(config_name, ''), '未识别') AS config, "
+                "COALESCE(NULLIF(route, ''), '其他路由') AS route, "
+                "COALESCE(NULLIF(target, ''), '未知目标') AS target, "
                 "SUM(upload) AS upload, SUM(download) AS download, "
                 "SUM(upload) + SUM(download) AS total "
-                "FROM connections INDEXED BY idx_connections_last_seen "
-                "WHERE start_time <= ? AND last_seen >= ? AND (upload + download) > 0 "
+                "FROM flow_samples WHERE ts BETWEEN ? AND ? AND (upload + download) > 0 "
                 "GROUP BY source, config, route, target ORDER BY total DESC LIMIT ?",
-                (until, since, limit),
+                (since, until, limit),
             ).fetchall()
         return {
             "items": [dict(row) for row in rows],
-            "scope": "connections_overlapping_window",
+            "scope": "paths_sampled_in_window",
         }
 
     def options(self, range_name, start=None, end=None):
+        rdb = self._reader()
         since, until = self.time_window(range_name, start, end)
-        with self.lock:
+        with self._read():
             # One pass over the window instead of three separate DISTINCT scans.
             # The distinct values come from a handful of columns, so the number
             # of combinations stays far below the number of matching rows.
-            rows = self.db.execute(
+            rows = rdb.execute(
                 "SELECT DISTINCT protocol, user, config_name FROM connections "
                 "INDEXED BY idx_connections_last_seen WHERE start_time <= ? AND last_seen >= ?",
                 (until, since),
@@ -902,26 +1055,28 @@ class AuditStore:
         return AuditStore._connection_counts_query(params, ("source_ip", "config_name", "user"))
 
     def _connection_count_map(self, params):
+        rdb = self._reader()
         query, values = self._identity_connection_counts(params)
-        rows = self.db.execute(query, values).fetchall()
+        rows = rdb.execute(query, values).fetchall()
         return {(row["source_ip"], row["config_name"], row["user"]): row["connections"] for row in rows}
 
     def client_usage(self, params):
+        rdb = self._reader()
         where, values = self._usage_where(params)
         group = " GROUP BY source_ip, config_name, user"
         page = max(1, as_int(params.get("page", [1])[0], 1))
         limit = clamp(as_int(params.get("limit", [50])[0], 50), 1, 200)
         offset = (page - 1) * limit
-        with self.lock:
+        with self._read():
             connection_counts = self._connection_count_map(params)
             # COUNT(*) over the grouped rows and COUNT(*) over the distinct keys
             # give the same total, but the distinct form lets SQLite count
             # through a narrower temp B-tree.
-            total = self.db.execute(
+            total = rdb.execute(
                 "SELECT COUNT(*) FROM (SELECT DISTINCT source_ip, config_name, user "
                 "FROM usage_samples WHERE " + where + ")", values
             ).fetchone()[0]
-            rows = self.db.execute(
+            rows = rdb.execute(
                 self._usage_select() + where + group + " ORDER BY total DESC, source_ip LIMIT ? OFFSET ?",
                 values + [limit, offset],
             ).fetchall()
@@ -941,8 +1096,9 @@ class AuditStore:
         # A config total is the sum over its identities, so grouping the same
         # filtered rows by config_name alone returns the identical number while
         # SQLite sorts a much narrower key.
+        rdb = self._reader()
         query, values = self._connection_counts_query(params, ("config_name",))
-        return {row["config_name"]: row["connections"] for row in self.db.execute(query, values).fetchall()}
+        return {row["config_name"]: row["connections"] for row in rdb.execute(query, values).fetchall()}
 
     @staticmethod
     def _config_usage_select():
@@ -955,12 +1111,13 @@ class AuditStore:
         )
 
     def config_usage(self, params):
+        rdb = self._reader()
         where, values = self._usage_where(params)
         group = " GROUP BY config_name"
         page = max(1, as_int(params.get("page", [1])[0], 1))
         limit = clamp(as_int(params.get("limit", [50])[0], 50), 1, 200)
         offset = (page - 1) * limit
-        with self.lock:
+        with self._read():
             connection_counts = self._config_connection_count_map(params)
             # SQLite has to group every row of the window before it can order
             # the result, so the grouped rows already are the config list: they
@@ -969,7 +1126,7 @@ class AuditStore:
             # directory, so there are few enough groups to page here.  The
             # identity list in client_usage can be much longer, so it keeps its
             # SQL-side count.
-            grouped = self.db.execute(
+            grouped = rdb.execute(
                 self._config_usage_select() + where + group + " ORDER BY total DESC, config_name", values
             ).fetchall()
         total = len(grouped)
@@ -986,12 +1143,13 @@ class AuditStore:
         }
 
     def connections(self, params):
+        rdb = self._reader()
         where, values = self._connection_where(params)
         page = max(1, as_int(params.get("page", [1])[0], 1))
         limit = clamp(as_int(params.get("limit", [50])[0], 50), 1, 200)
         offset = (page - 1) * limit
-        with self.lock:
-            total = self.db.execute(
+        with self._read():
+            total = rdb.execute(
                 "SELECT COUNT(*) FROM connections INDEXED BY idx_connections_last_seen WHERE " + where, values
             ).fetchone()[0]
             rows = self._connection_page(where, values, params.get("status", [""])[0].strip(), limit, offset)
@@ -1018,6 +1176,7 @@ class AuditStore:
         backwards once for the live rows and once for the finished ones returns
         the identical order and stops as soon as the page is full.
         """
+        rdb = self._reader()
         def page_query(group):
             return (
                 "SELECT * FROM connections INDEXED BY idx_connections_last_seen WHERE " + where + group
@@ -1027,15 +1186,16 @@ class AuditStore:
         wanted = limit + offset
         if status:
             # A status filter makes the ordering a plain last_seen sort.
-            return self.db.execute(page_query(""), values + [wanted]).fetchall()[offset:]
-        active = self.db.execute(page_query(" AND status = 'active'"), values + [wanted]).fetchall()
-        finished = self.db.execute(page_query(" AND status != 'active'"), values + [wanted]).fetchall()
+            return rdb.execute(page_query(""), values + [wanted]).fetchall()[offset:]
+        active = rdb.execute(page_query(" AND status = 'active'"), values + [wanted]).fetchall()
+        finished = rdb.execute(page_query(" AND status != 'active'"), values + [wanted]).fetchall()
         return (active + finished)[offset:offset + limit]
 
     def write_export(self, params, export_format, output):
+        rdb = self._reader()
         where, values = self._connection_where(params)
-        with self.lock:
-            rows = self.db.execute(
+        with self._read():
+            rows = rdb.execute(
                 "SELECT * FROM connections INDEXED BY idx_connections_last_seen WHERE " + where
                 + " ORDER BY start_time DESC", values
             )
@@ -1060,11 +1220,12 @@ class AuditStore:
             return output.tell()
 
     def write_usage_export(self, params, export_format, output):
+        rdb = self._reader()
         where, values = self._usage_where(params)
         query = self._usage_select() + where + " GROUP BY source_ip, config_name, user ORDER BY total DESC, source_ip"
-        with self.lock:
+        with self._read():
             connection_counts = self._connection_count_map(params)
-            rows = self.db.execute(query, values)
+            rows = rdb.execute(query, values)
             if export_format == "csv":
                 output.write(b"\xef\xbb\xbf")
                 text_output = io.TextIOWrapper(output, encoding="utf-8", newline="", write_through=True)
@@ -1090,11 +1251,12 @@ class AuditStore:
             return output.tell()
 
     def write_config_usage_export(self, params, export_format, output):
+        rdb = self._reader()
         where, values = self._usage_where(params)
         query = self._config_usage_select() + where + " GROUP BY config_name ORDER BY total DESC, config_name"
-        with self.lock:
+        with self._read():
             connection_counts = self._config_connection_count_map(params)
-            rows = self.db.execute(query, values)
+            rows = rdb.execute(query, values)
             if export_format == "csv":
                 output.write(b"\xef\xbb\xbf")
                 text_output = io.TextIOWrapper(output, encoding="utf-8", newline="", write_through=True)
@@ -1254,6 +1416,9 @@ class AuditHandler(BaseHTTPRequestHandler):
         except Exception as error:
             self._internal_error(error)
         finally:
+            # The request is over, so give its read-only connection back; a
+            # browser that abandons requests must not leak one connection each.
+            self.server.store.release_reader()
             self._report_slow_request(time.monotonic() - started)
 
     def _report_slow_request(self, elapsed):
@@ -1378,6 +1543,15 @@ class AuditHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             self._json({"error": "invalid_time_range", "message": str(error)}, HTTPStatus.BAD_REQUEST)
             return
+        try:
+            self._dispatch_api(parsed, params, range_name, start, end)
+        except StoreBusy as error:
+            # Answer immediately instead of letting the request hang until the
+            # browser gives up: the dashboard then reports a busy panel and its
+            # own backoff slows the next round down.
+            self._json({"error": "busy", "message": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+
+    def _dispatch_api(self, parsed, params, range_name, start, end):
         if parsed.path == "/api/summary":
             payload = self.server.store.summary(range_name, start, end)
             payload["collector"] = self.server.collector.status()

@@ -88,6 +88,7 @@ async function api(path, options = {}) {
     showTokenDialog();
     throw new Error("访问令牌无效");
   }
+  if (response.status === 503) throw new Error("审计服务繁忙，已自动降频");
   if (!response.ok) throw new Error(`请求失败 (${response.status})`);
   try {
     return await response.json();
@@ -103,13 +104,23 @@ function showTokenDialog(message = "") {
 }
 
 // Schedule the next refresh only once the current round has finished, so a slow
-// response cannot stack parallel rounds on top of each other.
-function startRefreshTimer() {
+// response cannot stack parallel rounds on top of each other.  A round that
+// already takes longer than the interval means the service is behind, so the
+// next round waits longer as well: polling a loaded audit service every five
+// seconds only makes its queue worse.
+const refreshInterval = 5000;
+const maxRefreshInterval = 30000;
+
+function startRefreshTimer(delay = refreshInterval) {
   if (state.timer) window.clearTimeout(state.timer);
   state.timer = window.setTimeout(async () => {
+    const started = Date.now();
     await loadDashboard();
-    startRefreshTimer();
-  }, 5000);
+    const elapsed = Date.now() - started;
+    startRefreshTimer(elapsed > refreshInterval
+      ? Math.min(maxRefreshInterval, elapsed * 2)
+      : refreshInterval);
+  }, delay);
 }
 
 let lastToast = { message: "", at: 0 };
