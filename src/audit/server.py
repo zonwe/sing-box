@@ -7,6 +7,7 @@ dashboard/API.  It intentionally uses only the Python standard library.
 """
 
 import argparse
+import collections
 import contextlib
 import csv
 import datetime
@@ -32,7 +33,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 
-SERVICE_VERSION = "1.3.4"
+SERVICE_VERSION = "1.3.5"
 USAGE_BUCKET_SECONDS = 60
 # destination_samples only ever feeds the "top destinations" ranking, which
 # aggregates the whole window and never shows a timestamp, so it does not need
@@ -68,6 +69,29 @@ CLIENT_IDLE_TIMEOUT = 30
 # dashboard refreshes several endpoints in parallel, so a wide range or a very
 # large window otherwise shows up only as unexplained CPU time.
 SLOW_REQUEST_SECONDS = 1.0
+# Every dashboard refresh runs six aggregate queries over the selected window,
+# and on a small VPS that is the largest part of the service's CPU.  The cadence
+# therefore belongs to the configuration instead of the front end: the browser
+# asks /api/health for it, stops polling entirely while its tab is in the
+# background, and an installation that still sees too much load can slow it down
+# further with "sing-box audit set refresh".
+DEFAULT_REFRESH_INTERVAL = 15
+MAX_REFRESH_INTERVAL = 3600
+# A dashboard round asks for the same handful of aggregates as the record
+# drawer, a second tab, or a user clicking through ranges, and each of those is
+# a full scan of the window.  Keeping the serialized answer for a few seconds
+# removes the repeated work without showing stale numbers: the collector samples
+# once a second at most.  Set cache_seconds to 0 to answer every request from
+# the database.
+DEFAULT_CACHE_SECONDS = 3
+CACHE_MAX_ENTRIES = 64
+# A collector that sees no connections and no traffic does not need to wake up
+# every second, so it backs off to this interval until the next poll finds
+# activity.  The cumulative counters keep the totals exact; only the connection
+# detail of a connection that starts and ends inside the idle window is missed.
+# 0 disables the backoff and polls at the active interval forever.
+DEFAULT_IDLE_INTERVAL = 5
+MAX_IDLE_INTERVAL = 60
 # The dashboard aggregates scan a time window that is far larger than SQLite's
 # default 2 MB page cache, so every scanned row used to cost a read syscall and
 # the system CPU that goes with it.  A memory map hands those pages to the OS
@@ -731,6 +755,14 @@ class AuditStore:
                 self._purge_locked(self.retention_days)
                 self._state_set("last_cleanup", now)
 
+        # The collector uses this to tell an idle server from a busy one; see
+        # Collector.idle.
+        return {
+            "connections": len(active_ids),
+            "upload": upload_delta,
+            "download": download_delta,
+        }
+
     def _purge_locked(self, days):
         cutoff = int(time.time()) - clamp(as_int(days, self.retention_days), 1, 3650) * 86400
         samples = self.db.execute("DELETE FROM traffic_samples WHERE ts < ?", (cutoff,)).rowcount
@@ -1285,11 +1317,18 @@ class AuditStore:
 
 
 class Collector:
-    def __init__(self, store, url, secret, interval, resolver=None):
+    def __init__(self, store, url, secret, interval, resolver=None, idle_interval=None):
         self.store = store
         self.url = url.rstrip("/") + "/connections"
         self.secret = secret
         self.interval = clamp(as_int(interval, 1), 1, 60)
+        # An idle server does not need a poll every second, so the collector
+        # waits idle_interval while nothing is connected and no bytes moved.
+        # Polling slower than the active interval would defeat the purpose, and
+        # 0 turns the backoff off.
+        idle = clamp(as_int(idle_interval, DEFAULT_IDLE_INTERVAL), 0, MAX_IDLE_INTERVAL)
+        self.idle_interval = max(idle, self.interval) if idle else 0
+        self.idle = False
         self.resolver = resolver
         self.opener = build_opener(ProxyHandler({}))
         self.stop_event = threading.Event()
@@ -1311,7 +1350,11 @@ class Collector:
     def status(self):
         with self.lock:
             running = bool(self.thread and self.thread.is_alive() and not self.stop_event.is_set())
-            grace = max(self.interval * 3 + 2, COLLECTOR_STATUS_GRACE)
+            idle = bool(self.idle_interval and self.idle)
+            interval = self.idle_interval if idle else self.interval
+            # A poll that is slow because the server is idle is not a failure, so
+            # the freshness check follows the interval the collector is using now.
+            grace = max(interval * 3 + 2, COLLECTOR_STATUS_GRACE)
             return {
                 "running": running,
                 "connected": bool(running and not self.last_error and self.last_success and time.time() - self.last_success <= grace),
@@ -1319,7 +1362,10 @@ class Collector:
                 "last_success": utc_iso(self.last_success),
                 "last_error": self.last_error,
                 "source": self.url,
-                "interval": self.interval,
+                "interval": interval,
+                "active_interval": self.interval,
+                "idle_interval": self.idle_interval,
+                "idle": idle,
             }
 
     def _poll(self):
@@ -1335,11 +1381,18 @@ class Collector:
             snapshot = json.loads(response.read())
         if not isinstance(snapshot, dict) or "connections" not in snapshot:
             raise RuntimeError("sing-box API 返回了无效数据")
-        self.store.capture(snapshot, self.resolver)
+        captured = self.store.capture(snapshot, self.resolver) or {}
         with self.lock:
             self.last_success = int(time.time())
             self.last_error = ""
             self.failures = 0
+            # Nothing connected and no bytes moved: the next poll can wait for the
+            # idle interval instead of repeating this work every second.  The
+            # cumulative counters still account for the skipped time, so totals
+            # stay exact and a poll that finds traffic resumes the active interval.
+            self.idle = bool(self.idle_interval) and not (
+                captured.get("connections") or captured.get("upload") or captured.get("download")
+            )
 
     def _run(self):
         failures = 0
@@ -1359,10 +1412,65 @@ class Collector:
                 # Cap the backoff so a transient blip stays visible for seconds
                 # instead of leaving the dashboard red for up to a minute.
                 retry_interval = max(self.interval, min(COLLECTOR_RETRY_MAX, 2 ** min(failures, 6)))
+            elif self.idle_interval and self.idle:
+                retry_interval = self.idle_interval
             else:
                 retry_interval = self.interval
             wait_for = max(0.2, retry_interval - (time.monotonic() - started))
             self.stop_event.wait(wait_for)
+
+
+class ResponseCache:
+    """Keep the last answer of a read endpoint for a few seconds.
+
+    A dashboard round asks for six aggregates, the record drawer and a second
+    tab ask for the same ones again, and clicking through time ranges revisits a
+    window that was just computed.  Each of those is a full scan, so the
+    serialized JSON is kept for ``ttl`` seconds and served again while it is
+    still current.  A ttl of 0 turns the cache off.
+    """
+
+    def __init__(self, ttl, max_entries=CACHE_MAX_ENTRIES):
+        self.ttl = max(0.0, float(ttl))
+        self.max_entries = max(1, int(max_entries))
+        self.lock = threading.Lock()
+        self.entries = collections.OrderedDict()
+
+    def get(self, key):
+        if self.ttl <= 0:
+            return None
+        now = time.monotonic()
+        with self.lock:
+            entry = self.entries.get(key)
+            if entry is None:
+                return None
+            stored, body = entry
+            if now - stored >= self.ttl:
+                del self.entries[key]
+                return None
+            self.entries.move_to_end(key)
+            return body
+
+    def put(self, key, body):
+        if self.ttl <= 0:
+            return
+        with self.lock:
+            self.entries[key] = (time.monotonic(), body)
+            self.entries.move_to_end(key)
+            # Bounded so a long-lived service cannot grow this without limit; the
+            # oldest entry is the least likely to be asked for again.
+            while len(self.entries) > self.max_entries:
+                self.entries.popitem(last=False)
+
+
+# Endpoints whose whole response is a computed aggregate.  The streaming exports
+# are deliberately absent: they write their answer while they build it, and
+# holding a copy would mean buffering a whole export in memory.
+CACHEABLE_API_PATHS = frozenset({
+    "/api/summary", "/api/timeseries", "/api/activity", "/api/top-destinations",
+    "/api/traffic-flow", "/api/options", "/api/client-usage", "/api/config-usage",
+    "/api/connections",
+})
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -1441,7 +1549,11 @@ class AuditHandler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def _json(self, payload, status=200):
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._send_json(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), status
+        )
+
+    def _send_json(self, body, status=200):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -1479,6 +1591,9 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._json({
                 "ok": True, "service": "sing-box-audit", "version": SERVICE_VERSION,
                 "auth_required": bool(self.server.web_token),
+                # The dashboard polls at the cadence this installation asks for
+                # instead of a value baked into the front end.
+                "refresh_interval": self.server.refresh_interval,
                 "collector_running": collector["running"], "collector_connected": collector["connected"],
                 "collector_failures": collector["failures"],
             })
@@ -1546,43 +1661,68 @@ class AuditHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             self._json({"error": "invalid_time_range", "message": str(error)}, HTTPStatus.BAD_REQUEST)
             return
+        # The whole request line is the key, so a different range, page or filter
+        # is a different entry and a repeat of the same query is free.
+        cache_key = self.path if parsed.path in CACHEABLE_API_PATHS else None
+        if cache_key is not None:
+            cached = self.server.response_cache.get(cache_key)
+            if cached is not None:
+                self._send_json(cached)
+                return
         try:
-            self._dispatch_api(parsed, params, range_name, start, end)
+            payload = self._dispatch_api(parsed, params, range_name, start, end)
         except StoreBusy as error:
             # Answer immediately instead of letting the request hang until the
             # browser gives up: the dashboard then reports a busy panel and its
             # own backoff slows the next round down.
             self._json({"error": "busy", "message": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        if payload is None:
+            # The endpoint wrote its own response (an export) or refused it.
+            return
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if cache_key is not None:
+            self.server.response_cache.put(cache_key, body)
+        self._send_json(body)
 
     def _dispatch_api(self, parsed, params, range_name, start, end):
+        """Answer a read endpoint.
+
+        Returns the payload to send, or None when the response is already on the
+        wire (the streaming exports and the not-found reply).
+        """
+        store = self.server.store
         if parsed.path == "/api/summary":
-            payload = self.server.store.summary(range_name, start, end)
+            payload = store.summary(range_name, start, end)
             payload["collector"] = self.server.collector.status()
-            self._json(payload)
-        elif parsed.path == "/api/timeseries":
-            self._json(self.server.store.timeseries(range_name, params.get("bucket", [None])[0], start, end))
-        elif parsed.path == "/api/activity":
-            self._json(self.server.store.activity(range_name, params.get("timezone_offset", [0])[0], start, end))
-        elif parsed.path == "/api/top-destinations":
-            self._json({"items": self.server.store.top_destinations(range_name, params.get("limit", [8])[0], start, end)})
-        elif parsed.path == "/api/traffic-flow":
-            self._json(self.server.store.traffic_flow(range_name, params.get("limit", [12])[0], start, end))
-        elif parsed.path == "/api/options":
-            self._json(self.server.store.options(range_name, start, end))
-        elif parsed.path == "/api/client-usage":
-            self._json(self.server.store.client_usage(params))
-        elif parsed.path == "/api/config-usage":
-            self._json(self.server.store.config_usage(params))
-        elif parsed.path == "/api/connections":
-            self._json(self.server.store.connections(params))
-        elif parsed.path == "/api/usage-export":
+            return payload
+        if parsed.path == "/api/timeseries":
+            return store.timeseries(range_name, params.get("bucket", [None])[0], start, end)
+        if parsed.path == "/api/activity":
+            return store.activity(range_name, params.get("timezone_offset", [0])[0], start, end)
+        if parsed.path == "/api/top-destinations":
+            return {"items": store.top_destinations(range_name, params.get("limit", [8])[0], start, end)}
+        if parsed.path == "/api/traffic-flow":
+            return store.traffic_flow(range_name, params.get("limit", [12])[0], start, end)
+        if parsed.path == "/api/options":
+            return store.options(range_name, start, end)
+        if parsed.path == "/api/client-usage":
+            return store.client_usage(params)
+        if parsed.path == "/api/config-usage":
+            return store.config_usage(params)
+        if parsed.path == "/api/connections":
+            return store.connections(params)
+        if parsed.path == "/api/usage-export":
             self._export(params, usage=True)
-        elif parsed.path == "/api/config-usage-export":
+            return None
+        if parsed.path == "/api/config-usage-export":
             self._export(params, config_usage=True)
-        elif parsed.path == "/api/export":
+            return None
+        if parsed.path == "/api/export":
             self._export(params)
-        else:
-            self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+            return None
+        self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+        return None
 
     def _export(self, params, usage=False, config_usage=False):
         export_format = params.get("format", ["csv"])[0].lower()
@@ -1618,6 +1758,28 @@ class AuditHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
 
 
+def normalize_settings(config):
+    """Fill in the tunables with their defaults.
+
+    A configuration written by an older release has none of these keys, and the
+    values are also clamped here so a hand-edited file cannot ask for a poll or
+    refresh cadence the service would not survive.
+    """
+    config["poll_interval"] = clamp(as_int(config.get("poll_interval", 1), 1), 1, 60)
+    config["idle_interval"] = clamp(
+        as_int(config.get("idle_interval", DEFAULT_IDLE_INTERVAL), DEFAULT_IDLE_INTERVAL),
+        0, MAX_IDLE_INTERVAL,
+    )
+    config["refresh_interval"] = clamp(
+        as_int(config.get("refresh_interval", DEFAULT_REFRESH_INTERVAL), DEFAULT_REFRESH_INTERVAL),
+        5, MAX_REFRESH_INTERVAL,
+    )
+    config["cache_seconds"] = clamp(
+        as_int(config.get("cache_seconds", DEFAULT_CACHE_SECONDS), DEFAULT_CACHE_SECONDS), 0, 300
+    )
+    return config
+
+
 def load_config(path):
     with open(path, "r", encoding="utf-8") as handle:
         config = json.load(handle)
@@ -1631,12 +1793,14 @@ def load_config(path):
     if len(str(config.get("web_token") or "")) < 16:
         raise ValueError("web_token 至少需要 16 个字符")
     config["port"] = port
+    normalize_settings(config)
     if not config.get("config_dir"):
         config["config_dir"] = os.path.abspath(os.path.join(os.path.dirname(path), "..", "conf"))
     return config
 
 
 def build_server(config):
+    config = normalize_settings(dict(config))
     web_root = config.get("web_root") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
     if not os.path.isfile(os.path.join(web_root, "index.html")):
         raise ValueError("找不到前端资源: " + web_root)
@@ -1650,13 +1814,15 @@ def build_server(config):
     resolver = ConfigIdentityResolver(config.get("config_dir", ""))
     collector = Collector(
         store, config["collector_url"], config.get("collector_secret", ""),
-        config.get("poll_interval", 1), resolver,
+        config["poll_interval"], resolver, config["idle_interval"],
     )
     server = ThreadingHTTPServer((config["listen"], config["port"]), AuditHandler)
     server.store = store
     server.collector = collector
     server.web_root = web_root
     server.web_token = web_token
+    server.refresh_interval = config["refresh_interval"]
+    server.response_cache = ResponseCache(config["cache_seconds"])
     return server
 
 

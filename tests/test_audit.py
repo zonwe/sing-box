@@ -72,6 +72,17 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(records["items"][0]["upload"], 40)
         self.assertEqual(records["items"][0]["host"], "example.com")
 
+    def test_capture_reports_activity_for_the_idle_check(self):
+        # The collector decides whether it may slow down from this summary, so a
+        # poll with connections and bytes must never look idle.
+        with mock.patch.object(audit.time, "time", return_value=3000):
+            busy = self.store.capture({"uploadTotal": 100, "downloadTotal": 200, "connections": [connection()]})
+        self.assertEqual(busy["connections"], 1)
+        self.assertEqual(busy["upload"], 0)
+        with mock.patch.object(audit.time, "time", return_value=3001):
+            idle = self.store.capture({"uploadTotal": 100, "downloadTotal": 200, "connections": []})
+        self.assertEqual(idle, {"connections": 0, "upload": 0, "download": 0})
+
     def test_filters_and_export_rows(self):
         with mock.patch.object(audit.time, "time", return_value=2000):
             self.store.capture({"uploadTotal": 0, "downloadTotal": 0, "connections": [connection()]})
@@ -501,7 +512,93 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM connections").fetchone()[0], 1)
 
 
+class FakeClashResponse:
+    status = 200
+
+    def __init__(self, payload):
+        self.body = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class FakeOpener:
+    """Stand-in for the urlopen opener, so Collector._poll runs without a server."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def open(self, _request, timeout=None):
+        return FakeClashResponse(self.payload)
+
+
 class CollectorTests(unittest.TestCase):
+    def test_poll_marks_the_collector_idle_only_when_nothing_moved(self):
+        store = mock.Mock()
+        collector = audit.Collector(store, "http://127.0.0.1:1", "", 1, None, 5)
+        collector.opener = FakeOpener({"uploadTotal": 0, "downloadTotal": 0, "connections": []})
+        store.capture.return_value = {"connections": 0, "upload": 0, "download": 0}
+        collector._poll()
+        self.assertTrue(collector.idle)
+        # One connection, or a single byte, brings the active cadence straight back.
+        store.capture.return_value = {"connections": 1, "upload": 0, "download": 0}
+        collector._poll()
+        self.assertFalse(collector.idle)
+
+    def test_idle_backoff_can_be_disabled_and_never_polls_faster(self):
+        store = mock.Mock()
+        store.capture.return_value = {"connections": 0, "upload": 0, "download": 0}
+        disabled = audit.Collector(store, "http://127.0.0.1:1", "", 1, None, 0)
+        self.assertEqual(disabled.idle_interval, 0)
+        disabled.opener = FakeOpener({"uploadTotal": 0, "downloadTotal": 0, "connections": []})
+        disabled._poll()
+        self.assertFalse(disabled.idle)
+        # An idle interval below the active one would poll faster than the
+        # configured cadence, so it is raised to match.
+        raised = audit.Collector(store, "http://127.0.0.1:1", "", 30, None, 5)
+        self.assertEqual(raised.idle_interval, 30)
+
+    def test_idle_collector_waits_longer_and_activity_resumes_the_interval(self):
+        collector = audit.Collector(None, "http://127.0.0.1:1", "", 1, None, 5)
+        collector.stop_event = mock.Mock()
+        collector.stop_event.is_set.side_effect = [False, False, True]
+        polls = []
+
+        def fake_poll():
+            # The first poll finds an idle server, the second one finds traffic;
+            # _poll marks this itself in the service.
+            polls.append(True)
+            collector.idle = len(polls) == 1
+
+        with mock.patch.object(collector, "_poll", side_effect=fake_poll):
+            with mock.patch.object(audit.time, "monotonic", return_value=0):
+                collector._run()
+        self.assertEqual(collector.stop_event.wait.call_args_list, [mock.call(5), mock.call(1)])
+
+    def test_status_reports_the_interval_in_use_while_idle(self):
+        collector = audit.Collector(None, "http://127.0.0.1:1", "", 1, None, 30)
+        collector.thread = mock.Mock()
+        collector.thread.is_alive.return_value = True
+        collector.last_error = ""
+        # Twenty seconds without a poll is normal for an idle collector but a
+        # missed deadline for an active one, so the freshness check has to follow
+        # the interval in use.
+        collector.last_success = time.time() - 20
+        collector.idle = True
+        idle_status = collector.status()
+        self.assertEqual(idle_status["interval"], 30)
+        self.assertEqual(idle_status["active_interval"], 1)
+        self.assertTrue(idle_status["idle"])
+        self.assertTrue(idle_status["connected"])
+        collector.idle = False
+        self.assertFalse(collector.status()["connected"])
+
     def test_sqlite_error_retries_and_success_resets_backoff(self):
         collector = audit.Collector(None, "http://127.0.0.1:1", "", 1)
         collector.stop_event = mock.Mock()
@@ -549,6 +646,32 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(collector.status()["failures"], 8)
 
 
+class ResponseCacheTests(unittest.TestCase):
+    def test_entry_expires_after_its_ttl(self):
+        cache = audit.ResponseCache(5)
+        with mock.patch.object(audit.time, "monotonic", return_value=100):
+            cache.put("/api/summary?range=24h", b'{"total":1}')
+            self.assertEqual(cache.get("/api/summary?range=24h"), b'{"total":1}')
+        with mock.patch.object(audit.time, "monotonic", return_value=104.9):
+            self.assertEqual(cache.get("/api/summary?range=24h"), b'{"total":1}')
+        with mock.patch.object(audit.time, "monotonic", return_value=105):
+            self.assertIsNone(cache.get("/api/summary?range=24h"))
+
+    def test_zero_ttl_keeps_nothing(self):
+        cache = audit.ResponseCache(0)
+        cache.put("/api/connections?range=1h", b"[]")
+        self.assertIsNone(cache.get("/api/connections?range=1h"))
+
+    def test_entries_are_bounded_and_the_oldest_is_dropped(self):
+        cache = audit.ResponseCache(60, max_entries=2)
+        cache.put("a", b"1")
+        cache.put("b", b"2")
+        cache.put("c", b"3")
+        self.assertIsNone(cache.get("a"))
+        self.assertEqual(cache.get("b"), b"2")
+        self.assertEqual(cache.get("c"), b"3")
+
+
 class ServerConfigTests(unittest.TestCase):
     @staticmethod
     def config(token):
@@ -560,6 +683,23 @@ class ServerConfigTests(unittest.TestCase):
             "web_token": token,
             "web_root": str(ROOT / "src" / "audit" / "web"),
         }
+
+    def test_normalize_settings_fills_defaults_for_an_older_config(self):
+        # A config written before these keys existed must keep working.
+        settings = audit.normalize_settings({"port": 9091})
+        self.assertEqual(settings["poll_interval"], 1)
+        self.assertEqual(settings["idle_interval"], audit.DEFAULT_IDLE_INTERVAL)
+        self.assertEqual(settings["refresh_interval"], audit.DEFAULT_REFRESH_INTERVAL)
+        self.assertEqual(settings["cache_seconds"], audit.DEFAULT_CACHE_SECONDS)
+
+    def test_normalize_settings_clamps_hand_edited_values(self):
+        settings = audit.normalize_settings({
+            "poll_interval": 0, "idle_interval": 999, "refresh_interval": 1, "cache_seconds": -5,
+        })
+        self.assertEqual(settings["poll_interval"], 1)
+        self.assertEqual(settings["idle_interval"], audit.MAX_IDLE_INTERVAL)
+        self.assertEqual(settings["refresh_interval"], 5)
+        self.assertEqual(settings["cache_seconds"], 0)
 
     def test_build_server_refuses_an_empty_web_token(self):
         # AuditHandler treats an empty token as "authentication disabled", so a
@@ -611,6 +751,10 @@ class HttpIntegrationTests(unittest.TestCase):
             "collector_secret": "source-secret",
             "web_token": "test-web-token-123456",
             "poll_interval": 1,
+            # Every request of this fixture has to hit the database, otherwise the
+            # polling loops below would keep reading a cached answer; the cache
+            # itself is covered by test_repeated_dashboard_query_is_served_from_the_cache.
+            "cache_seconds": 0,
             "retention_days": 90,
             "web_root": str(ROOT / "src" / "audit" / "web"),
         }
@@ -643,6 +787,8 @@ class HttpIntegrationTests(unittest.TestCase):
             self.assertTrue(health["collector_running"])
             self.assertTrue(health["collector_connected"])
             self.assertEqual(health["collector_failures"], 0)
+            # The dashboard polls at the cadence this installation asks for.
+            self.assertEqual(health["refresh_interval"], audit.DEFAULT_REFRESH_INTERVAL)
         with self.assertRaises(HTTPError) as denied:
             self.request("/api/summary")
         self.assertEqual(denied.exception.code, 401)
@@ -684,6 +830,27 @@ class HttpIntegrationTests(unittest.TestCase):
             self.assertIn("配置文件流量", page)
             self.assertIn("访问热力", page)
             self.assertIn("流量路径", page)
+
+    def test_repeated_dashboard_query_is_served_from_the_cache(self):
+        self.server.response_cache = audit.ResponseCache(30)
+        calls = []
+        original = audit.AuditStore.summary
+
+        def counting_summary(store_self, *args, **kwargs):
+            calls.append(args)
+            return original(store_self, *args, **kwargs)
+
+        with mock.patch.object(audit.AuditStore, "summary", counting_summary):
+            for _ in range(3):
+                with self.request("/api/summary?range=24h", "test-web-token-123456") as response:
+                    payload = json.load(response)
+                    self.assertTrue(payload["collector"]["connected"])
+        self.assertEqual(len(calls), 1)
+        # A different window is a different key, so it must reach the database.
+        with mock.patch.object(audit.AuditStore, "summary", counting_summary):
+            with self.request("/api/summary?range=1h", "test-web-token-123456") as response:
+                response.read()
+        self.assertEqual(len(calls), 2)
 
     def test_keep_alive_serves_several_requests_on_one_connection(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)

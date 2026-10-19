@@ -184,6 +184,47 @@ audit_export json 7d "$OUTPUT"
                     self.assertTrue(json.loads(output.read_text())["exported"])
                 self.assertEqual(list(self.root.glob("*.tmp.*")), [])
 
+    def test_audit_set_validates_the_cadence_options(self):
+        # audit_set rewrites the service config through jq and only keeps the new
+        # file after the service accepts it; the service check and the restart are
+        # stubbed so this covers the validation and the rewrite alone.
+        config = {
+            "listen": "127.0.0.1",
+            "port": 9091,
+            "database": (self.root / "audit.db").as_posix(),
+            "config_dir": self.conf.as_posix(),
+            "collector_url": "http://127.0.0.1:9090",
+            "web_token": "0123456789abcdef0123456789abcdef",
+            "poll_interval": 1,
+            "retention_days": 90,
+        }
+        script = functions("src/audit.sh", "audit_set") + '''
+err() { printf '%s\\n' "$*" >&2; exit 1; }
+audit_require_root() { :; }
+audit_service_action() { return 0; }
+python3() { return 0; }
+audit_set "$OPTION" "$VALUE"
+'''
+        cases = (
+            ("refresh", "30", "refresh_interval", 30),
+            ("idle", "0", "idle_interval", 0),
+            # Out of range values must be refused before the config is touched.
+            ("refresh", "4", "refresh_interval", None),
+            ("idle", "61", "idle_interval", None),
+        )
+        for option, value, key, expected in cases:
+            with self.subTest(option=option, value=value):
+                (self.root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+                result = self.run_shell(script, OPTION=option, VALUE=value)
+                saved = json.loads((self.root / "config.json").read_text())
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(option, result.stderr)
+                    self.assertNotIn(key, saved)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(saved[key], expected)
+
     def test_update_preserves_stopped_service_and_rolls_back_failed_restart(self):
         for module in ("src/download.sh", "install.sh"):
             for directory in (False, True):

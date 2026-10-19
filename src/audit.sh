@@ -7,7 +7,7 @@ audit_usage() {
     msg "   $is_core audit url                             显示前端访问地址"
     msg "   $is_core audit token                           显示前端访问令牌"
     msg "   $is_core audit start|stop|restart              管理审计服务"
-    msg "   $is_core audit set <option> <value>             修改 listen/port/retention/interval/token"
+    msg "   $is_core audit set <option> <value>             修改 listen/port/retention/interval/idle/refresh/token"
     msg "   $is_core audit export [csv|json] [range] [file] 导出数据 (range: 1h/6h/24h/7d/30d/all)"
     msg "   $is_core audit report [csv|json] [range] [file] 按 IP/配置汇总并导出用量"
     msg "   $is_core audit config-report [csv|json] [range] [file] 按配置文件汇总并导出用量"
@@ -258,6 +258,9 @@ audit_enable() {
             collector_secret: $collector_secret,
             web_token: $web_token,
             poll_interval: 1,
+            idle_interval: 5,
+            refresh_interval: 15,
+            cache_seconds: 3,
             retention_days: 90,
             managed_clash_api: $managed_clash_api,
             managed_controller: $managed_controller
@@ -304,6 +307,7 @@ audit_status() {
         return
     fi
     local service_status health health_host listen port summary token
+    local interval idle_interval refresh_interval
     if [[ $is_systemd ]]; then
         service_status=$(systemctl is-active "$is_audit_name" 2>/dev/null)
     elif [[ $is_openrc ]]; then
@@ -324,6 +328,11 @@ audit_status() {
     msg "\n流量审计: $service_status"
     msg "监听地址: $listen:$port"
     msg "数据保留: $(audit_config_get '.retention_days') 天"
+    interval=$(audit_config_get '.poll_interval')
+    idle_interval=$(audit_config_get '.idle_interval')
+    refresh_interval=$(audit_config_get '.refresh_interval')
+    msg "采集间隔: ${interval:-1} 秒, 空闲时 ${idle_interval:-5} 秒"
+    msg "页面刷新: ${refresh_interval:-15} 秒 (页面在后台时暂停)"
     if [[ $(jq -r '.ok // false' <<<"$health" 2>/dev/null) == true ]]; then
         msg "前端服务: $(_green 可访问)"
     else
@@ -342,7 +351,7 @@ audit_set() {
     audit_require_root
     [[ -f $is_audit_config ]] || err "流量审计尚未启用."
     local option=$1 value=$2 config_tmp config_backup current_port
-    [[ $option && $value ]] || err "正确使用: $is_core audit set <listen|port|retention|interval|token> <value>"
+    [[ $option && $value ]] || err "正确使用: $is_core audit set <listen|port|retention|interval|idle|refresh|token> <value>"
     config_tmp=$(mktemp)
     config_backup=$(mktemp)
     cp -f "$is_audit_config" "$config_backup"
@@ -367,6 +376,14 @@ audit_set() {
     interval)
         [[ $value =~ ^[0-9]+$ && $value -ge 1 && $value -le 60 ]] || err "interval 必须为 1 到 60 秒."
         jq --argjson value "$value" '.poll_interval = $value' "$is_audit_config" >"$config_tmp"
+        ;;
+    idle)
+        [[ $value =~ ^[0-9]+$ && $value -ge 0 && $value -le 60 ]] || err "idle 必须为 0 到 60 秒 (0 表示不降频)."
+        jq --argjson value "$value" '.idle_interval = $value' "$is_audit_config" >"$config_tmp"
+        ;;
+    refresh)
+        [[ $value =~ ^[0-9]+$ && $value -ge 5 && $value -le 3600 ]] || err "refresh 必须为 5 到 3600 秒."
+        jq --argjson value "$value" '.refresh_interval = $value' "$is_audit_config" >"$config_tmp"
         ;;
     token)
         [[ $value == reset ]] && value=$(audit_random_token)

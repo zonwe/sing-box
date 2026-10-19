@@ -108,11 +108,28 @@ function showTokenDialog(message = "") {
 // already takes longer than the interval means the service is behind, so the
 // next round waits longer as well: polling a loaded audit service every five
 // seconds only makes its queue worse.
-const refreshInterval = 5000;
-const maxRefreshInterval = 30000;
+//
+// Every round is six aggregate queries over the selected window, which is the
+// largest part of the audit service's CPU on a small VPS.  The cadence therefore
+// comes from the service (GET /api/health) and falls back to a slow default, and
+// a hidden tab stops polling entirely instead of asking for data nobody sees.
+const minRefreshInterval = 5000;
+const maxRefreshInterval = 300000;
+const defaultRefreshInterval = 15000;
+let refreshInterval = defaultRefreshInterval;
+
+function applyRefreshInterval(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value <= 0) return;
+  refreshInterval = Math.min(maxRefreshInterval, Math.max(minRefreshInterval, value * 1000));
+}
 
 function startRefreshTimer(delay = refreshInterval) {
   if (state.timer) window.clearTimeout(state.timer);
+  state.timer = null;
+  // A background tab must not keep the server busy: the chain simply stops here
+  // and the visibility listener below starts it again when the page comes back.
+  if (document.hidden) return;
   state.timer = window.setTimeout(async () => {
     const started = Date.now();
     await loadDashboard();
@@ -122,6 +139,17 @@ function startRefreshTimer(delay = refreshInterval) {
       : refreshInterval);
   }, delay);
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    if (state.timer) window.clearTimeout(state.timer);
+    state.timer = null;
+    return;
+  }
+  // Coming back should show current numbers, but the round still runs through
+  // the same chain so a slow service keeps its backoff.
+  startRefreshTimer(0);
+});
 
 let lastToast = { message: "", at: 0 };
 
@@ -759,6 +787,8 @@ async function boot() {
   state.customEnd = $("rangeEnd").value;
   try {
     const health = await fetch("/api/health", { cache: "no-store" }).then((response) => response.json());
+    // Older services do not publish a cadence; the slow default stands in.
+    applyRefreshInterval(health.refresh_interval);
     if (health.auth_required && !state.token) { showTokenDialog(); return; }
     await loadDashboard();
   } catch (error) {

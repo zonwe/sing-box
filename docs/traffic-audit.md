@@ -32,7 +32,8 @@ sing-box ── 本机 Clash API ──► sing-box-audit
 | --- | --- |
 | 服务名 | `sing-box-audit` |
 | Web 监听 | `127.0.0.1:9091` |
-| 采集间隔 | 1 秒 |
+| 采集间隔 | 1 秒（无连接且无流量时 5 秒） |
+| 页面刷新间隔 | 15 秒（页面在后台时暂停） |
 | 数据保留 | 90 天 |
 | 数据库 | `/var/lib/sing-box-audit/audit.db` |
 | 服务配置 | `/etc/sing-box/audit/config.json` |
@@ -257,7 +258,7 @@ curl http://127.0.0.1:9091/api/health
 预期返回类似：
 
 ```json
-{"ok":true,"service":"sing-box-audit","version":"1.3.4","auth_required":true}
+{"ok":true,"service":"sing-box-audit","version":"1.3.5","auth_required":true,"refresh_interval":15}
 ```
 
 ## 5. 访问 Web 仪表盘
@@ -338,11 +339,12 @@ server {
 新样本时速率显示为零。网络或 SQLite 错误会触发自动重试，连续失败时退避至最多 15 秒，
 成功后恢复设置的采集间隔。`/api/health` 中的 `ok` 表示 Web 服务可访问，
 `collector_running`、`collector_connected` 和 `collector_failures` 分别表示采集线程存活、
-最近采集正常以及连续失败次数。`/api/health` 和 `/api/summary` 都带 `version`，可用于
-确认服务器上运行的服务版本。
+最近采集正常以及连续失败次数，`refresh_interval` 是页面应该采用的刷新间隔（秒）。
+`/api/health` 和 `/api/summary` 都带 `version`，可用于确认服务器上运行的服务版本。
 
-页面每 5 秒刷新一次，并且只会在上一轮请求结束后再排下一次，因此单轮变慢不会叠加并发；
-采集服务默认每 1 秒读取一次 sing-box 状态。页面关闭不会停止采集，
+页面按服务下发的间隔刷新，默认 15 秒，并且只会在上一轮请求结束后再排下一次，因此单轮变慢
+不会叠加并发；标签页切到后台后页面完全停止刷新，切回来时立即补一轮。采集服务默认每 1 秒
+读取一次 sing-box 状态，在没有连接也没有流量的空闲期自动放慢到 5 秒。页面关闭不会停止采集，
 只要 `sing-box-audit` 服务运行，数据就会继续写入 SQLite。
 
 ## 7. 命令行使用
@@ -395,6 +397,20 @@ sing-box audit set retention 30
 ```bash
 sing-box audit set interval 5
 ```
+
+修改空闲采集间隔，允许范围为 0–60 秒；空闲指没有连接且没有流量，0 表示不降频：
+
+```bash
+sing-box audit set idle 5
+```
+
+修改页面刷新间隔，允许范围为 5–3600 秒：
+
+```bash
+sing-box audit set refresh 30
+```
+
+页面刷新间隔由服务下发给浏览器，改完刷新页面即可生效；标签页在后台时始终不刷新。
 
 重新生成访问令牌：
 
@@ -570,7 +586,7 @@ unset AUDIT_TOKEN
 
 | 接口 | 用途 |
 | --- | --- |
-| `/api/health` | 服务健康和版本，不需要令牌 |
+| `/api/health` | 服务健康、版本和页面刷新间隔，不需要令牌 |
 | `/api/summary?range=24h` | 汇总、速率、连接数和采集状态 |
 | `/api/timeseries?range=24h` | 流量趋势 |
 | `/api/top-destinations?range=24h` | 热门目标 |
@@ -739,9 +755,32 @@ CPU 主要花在两个地方，先看日志再决定调哪个：
 - **采集线程**：默认每秒读取一次 Clash API，并按活动连接数写入增量。开销与并发连接数
   成正比，空闲时几乎可以忽略。放慢采集间隔即可降低：
   `sing-box audit set interval 5`。
-- **仪表盘聚合**：页面每 5 秒刷新一次，每次都会按当前时间范围重新聚合。开销与所选范围
-  覆盖的数据量成正比，24 小时通常很轻，7 天、30 天和「全部」会明显变大。选择较短的范围，
-  或处理完问题后关闭页面，都能立刻降下来；关闭页面不会停止采集。
+- **仪表盘聚合**：页面每次刷新都会按当前时间范围重新聚合。开销与所选范围覆盖的数据量
+  成正比，24 小时通常很轻，7 天、30 天和「全部」会明显变大。
+
+从 V1.3.5 起，仪表盘默认 15 秒刷新一次（旧版本是 5 秒），标签页切到后台后完全停止刷新，
+切回时立即补一轮；相同查询在 3 秒内由服务直接复用上次结果，多个标签页或反复切换时间范围
+不会重复扫描。服务在空闲（无连接且无流量）时自动把采集放慢到 5 秒。这几项默认值都可以在
+配置里调整：
+
+```bash
+sing-box audit set refresh 30   # 页面刷新间隔, 5–3600 秒
+sing-box audit set idle 10      # 空闲采集间隔, 0–60 秒, 0 表示不降频
+sing-box audit set interval 3   # 有流量时的采集间隔, 1–60 秒
+```
+
+配置里的 `cache_seconds`（默认 3，0 表示关闭）控制上面提到的响应复用窗口，需要手动编辑
+`/etc/sing-box/audit/config.json`。`sing-box audit status` 会显示当前生效的采集间隔、
+空闲间隔和页面刷新间隔。
+
+如果仍然偏高，按下面的顺序继续排查：
+
+1. 确认页面确实没有留在前台长期刷新；关闭页面不会停止采集，所以后台标签页和常驻的
+   仪表盘窗口是最容易被忽略的来源。
+2. 选择较短的时间范围，或处理完问题后关闭页面。
+3. 日志里长期出现 `config-usage`、`client-usage` 或 `traffic-flow`，说明所选范围里的历史
+   记录已经很多：可以缩短保留天数（`sing-box audit set retention 30`）并在流量低谷执行
+   `sing-box audit purge 30` 回收旧数据。
 
 从 V1.3.2 起，处理时间达到 1 秒的请求会连同地址写入服务日志，可以直接确认是哪个接口在
 消耗 CPU：
@@ -751,10 +790,6 @@ journalctl -u sing-box-audit -n 200 --no-pager | grep 慢请求
 # OpenRC
 grep 慢请求 /var/log/sing-box/audit-error.log
 ```
-
-日志里长期出现 `config-usage`、`client-usage` 或 `traffic-flow`，说明所选范围里的历史记录
-已经很多：可以缩短保留天数（`sing-box audit set retention 30`）并在流量低谷执行
-`sing-box audit purge 30` 回收旧数据，或改用较短的时间范围查看。
 
 服务会为 SQLite 启用内存映射读取（最多 256 MB；无法映射的环境改用 32 MB 页缓存）。这些
 页属于操作系统页缓存，可以随时回收，因此 `ps` 或 `systemctl status` 里显示的内存偏高
@@ -771,6 +806,12 @@ V1.3.3 起，每个仪表盘请求使用自己的只读连接，因此查询之�
 
 V1.3.4 起，配置里的令牌为空时不再当作「无需验证」：服务会拒绝启动并写入错误日志，而不是把
 审计数据（来源 IP、UUID 用户、访问域名）匿名暴露给任何能连上监听端口的客户端。
+
+V1.3.5 起，页面刷新间隔改由服务下发（`/api/health` 的 `refresh_interval`，默认 15 秒），
+后台标签页不再刷新，相同查询在 `cache_seconds` 内复用服务端结果；采集线程在没有连接也没有
+流量时降到 `idle_interval`（默认 5 秒）。空闲降频只影响连接明细：总流量按累计计数差值记账，
+跳过的时间照常计入，只有在空闲窗口内建立并结束的连接可能不出现在明细里，需要完整明细时把
+`idle_interval` 设为 0。
 
 ## 11. 禁用与卸载
 
